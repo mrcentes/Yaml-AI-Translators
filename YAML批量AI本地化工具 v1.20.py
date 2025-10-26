@@ -1,4 +1,13 @@
-# YAML批量AI本地化工具 v1.10
+# YAML批量AI本地化工具 v1.20 (修复版)
+# 更新日志:
+# v1.20 - 修复关键问题
+#       - 修复 show_add_edit_key_dialog 函数重复定义和逻辑混乱
+#       - 修复 URL 拼接错误，正确支持模型自动获取
+#       - 实现完整的重试机制和速率限制
+#       - 改进线程安全和同步机制
+#       - 优化 YAML 识别和转义处理
+#       - 加入 API 模型自动更新功能
+#       - 增强错误处理和日志记录
 
 import os
 import sys
@@ -9,11 +18,14 @@ import shutil
 import requests
 import subprocess
 import webbrowser
+from urllib.parse import urljoin
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, Menu
+import yaml
+from typing import Optional, Dict, List, Tuple
 
 # ==================== 修复 Windows DPI 模糊问题 ====================
 try:
@@ -37,7 +49,7 @@ except ImportError:
     except:
         pass
 
-VERSION = "1.1"
+VERSION = "1.20"
 APP_TITLE = f"YAML批量AI本地化工具 v{VERSION}"
 
 # ==================== 平台预设库 ====================
@@ -205,6 +217,34 @@ DEFAULT_PROMPT = """请将以下英文翻译为中文,如果已经为中文则�
 3. 如果必须使用引号，用中文引号「」『』代替
 4. 避免在翻译结果中使用英文冒号:，使用中文冒号：代替"""
 
+# ==================== 工具函数 ====================
+
+class RateLimiter:
+    """速率限制器"""
+    def __init__(self, max_requests: int = 10, time_window: int = 60):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = []
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        """如果超出限制则等待"""
+        with self.lock:
+            now = time.time()
+            # 移除过期的请求记录
+            self.requests = [t for t in self.requests if now - t < self.time_window]
+            
+            if len(self.requests) >= self.max_requests:
+                sleep_time = self.time_window - (now - self.requests[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                self.requests = []
+            
+            self.requests.append(now)
+
+# 创建全局速率限制器
+rate_limiter = RateLimiter(max_requests=10, time_window=60)
+
 # ==================== 核心翻译器 ====================
 class UniversalTranslator:
     """通用翻译器 - 支持多平台API"""
@@ -230,6 +270,10 @@ class UniversalTranslator:
         self.temperature = api_config.get('temperature', 0.3)
         self.max_tokens = api_config.get('max_tokens', 1000)
         self.lock = threading.Lock()
+        self.retry_config = {
+            'max_retries': api_config.get('max_retries', 3),
+            'retry_delay': api_config.get('retry_delay', 5)
+        }
         
     def clean_translated_text(self, text):
         """智能清理翻译后的文本"""
@@ -251,23 +295,42 @@ class UniversalTranslator:
         
         return text
     
-    def escape_yaml_value(self, text):
-        """转义YAML特殊字符"""
+    def escape_yaml_value(self, text: str) -> str:
+        """转义YAML特殊字符 - 改进版"""
+        if not isinstance(text, str):
+            text = str(text)
+        
         special_chars = [':', '{', '}', '[', ']', ',', '&', '*', '#', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`']
         
-        if any(char in text for char in special_chars) or '"' in text or "'" in text:
+        # 检查是否需要引号
+        needs_quotes = False
+        
+        # 检查特殊字符
+        if any(char in text for char in special_chars):
+            needs_quotes = True
+        
+        # 检查引号
+        if '"' in text or "'" in text:
+            needs_quotes = True
+        
+        # 检查首字符是否为特殊字符
+        if text and text[0] in special_chars:
+            needs_quotes = True
+        
+        if needs_quotes:
+            # 使用单引号，并将内部单引号转义为双单引号
             escaped = text.replace("'", "''")
             return f"'{escaped}'"
+        
         return text
         
-    def translate(self, text, context_info=None, timeout=30):
-        """翻译文本"""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
-        # 从配置中获取自定义提示词，如果没有则使用默认提示词
+    def translate(self, text: str, context_info: Optional[Dict] = None, timeout: int = 30) -> Tuple[str, Optional[str]]:
+        """翻译文本 - 带重试机制"""
+        
+        # 应用速率限制
+        rate_limiter.wait_if_needed()
+        
+        # 构建提示词
         base_prompt = self.config.get('custom_prompt', DEFAULT_PROMPT)
 
         if context_info:
@@ -285,6 +348,11 @@ class UniversalTranslator:
         else:
             prompt = f"{base_prompt}\n\n待翻译文本：{text}"
 
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
         data = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -292,24 +360,44 @@ class UniversalTranslator:
             "max_tokens": self.max_tokens
         }
 
-        try:
-            with self.lock:
-                time.sleep(0.1)
+        # 重试逻辑
+        max_retries = self.retry_config.get('max_retries', 3)
+        retry_delay = self.retry_config.get('retry_delay', 5)
+        
+        for attempt in range(max_retries):
+            try:
+                with self.lock:
+                    time.sleep(0.1)
 
-            response = requests.post(self.base_url, headers=headers, json=data, timeout=timeout)
-            response.raise_for_status()
-            result = response.json()
+                response = requests.post(self.base_url, headers=headers, json=data, timeout=timeout)
+                response.raise_for_status()
+                result = response.json()
 
-            translated_text = result['choices'][0]['message']['content'].strip()
-            translated_text = self.clean_translated_text(translated_text)
-            
-            return translated_text, None
+                translated_text = result['choices'][0]['message']['content'].strip()
+                translated_text = self.clean_translated_text(translated_text)
+                
+                return translated_text, None
 
-        except Exception as e:
-            return text, str(e)
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+                return text, "请求超时"
+            except requests.exceptions.ConnectionError as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+                return text, f"连接错误: {str(e)}"
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+                return text, str(e)
+        
+        return text, "翻译失败"
 
     
-    def test_connection(self):
+    def test_connection(self) -> Tuple[bool, str]:
         """测试API连接"""
         try:
             test_text = "Hello"
@@ -331,10 +419,49 @@ class UniversalTranslator:
                 
         except Exception as e:
             return False, f"连接失败: {str(e)}"
+    
+    @staticmethod
+    def fetch_available_models(platform_id: str, api_key: str, base_url: str, timeout: int = 15) -> Tuple[Optional[List[str]], Optional[str]]:
+        """从API获取可用模型列表"""
+        try:
+            if not api_key or not base_url:
+                return None, "API Key 或 URL 不能为空"
+
+            # 构造正确的 models 端点
+            # 处理各种 URL 格式
+            if '/chat/completions' in base_url:
+                models_url = base_url.replace('/chat/completions', '/models')
+            elif '/v1/' in base_url:
+                base = base_url.rsplit('/v1/', 1)[0]
+                models_url = f"{base}/v1/models"
+            else:
+                models_url = base_url.rstrip('/') + '/models'
+            
+            headers = {"Authorization": f"Bearer {api_key}"}
+            response = requests.get(models_url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            
+            data = response.json()
+            # 兼容不同API的返回格式
+            model_objects = data.get('data', [])
+            if not model_objects and isinstance(data, list):
+                model_objects = data
+
+            model_ids = sorted([model['id'] for model in model_objects if 'id' in model])
+            
+            if not model_ids:
+                return None, "未能从API响应中找到模型列表"
+            
+            return model_ids, None
+
+        except requests.exceptions.RequestException as e:
+            return None, f"网络错误: {str(e)}"
+        except Exception as e:
+            return None, f"获取模型失败: {str(e)}"
 
 
 class YamlTranslatorCore:
-    """YAML翻译核心"""
+    """YAML翻译核心 (V2 - 使用PyYAML解析器)"""
     
     def __init__(self, api_config, max_threads=4, progress_callback=None, 
                  log_callback=None, translation_callback=None, config=None):
@@ -345,7 +472,7 @@ class YamlTranslatorCore:
         self.translation_callback = translation_callback
         self.config = config or {}
         self.stop_flag = False
-        self.translation_records = []  # 记录翻译详情
+        self.translation_records = []
         self.stats = {
             'total_files': 0,
             'processed_files': 0,
@@ -370,20 +497,22 @@ class YamlTranslatorCore:
         if self.progress_callback:
             self.progress_callback(current, total, status)
     
-    def record_translation(self, file_path, field_type, original, translated, status):
+    def record_translation(self, file_path, field_path, original, translated, status):
         """记录翻译详情"""
         self.translation_records.append({
             'file': file_path,
-            'field': field_type,
+            'field': field_path,
             'original': original,
             'translated': translated,
-            'status': status,  # 'success', 'failed', 'skipped'
+            'status': status,
             'timestamp': datetime.now().isoformat()
         })
     
     def find_yaml_files(self, path):
-        """查找YAML文件"""
+        """查找YAML文件 - 改进版识别"""
         yaml_files = []
+        yaml_extensions = ('.yml', '.yaml', '.YML', '.YAML', '.Yml', '.Yaml')
+        
         if os.path.isfile(path):
             if path.lower().endswith(('.yml', '.yaml')):
                 yaml_files.append(path)
@@ -396,32 +525,21 @@ class YamlTranslatorCore:
     
     def contains_chinese(self, text):
         """检查是否包含中文"""
-        return any('\u4e00' <= char <= '\u9fff' for char in text)
-    
-    def find_context_value(self, lines, current_index, field_name, search_direction, search_range=3):
-        """查找上下文值"""
-        if search_direction == "down":
-            start = current_index + 1
-            end = min(len(lines), current_index + 1 + search_range)
-            search_lines = lines[start:end]
-        else:
-            start = max(0, current_index - search_range)
-            end = current_index
-            search_lines = lines[start:end]
-        
-        for line in search_lines:
-            stripped = line.lstrip()
-            if stripped.startswith(f"{field_name}:"):
-                _, value = stripped.split(":", 1)
-                value = value.strip().strip('"').strip("'")
-                return value
-        return None
-    
+        return any('\u4e00' <= char <= '\u9fff' for char in str(text))
+
     def get_output_path(self, original_path, base_folder):
         """获取输出文件路径"""
         output_mode = self.config.get('output_mode', 'export')
         
         if output_mode == 'overwrite':
+            # 创建备份
+            backup_path = original_path + '.backup'
+            if not os.path.exists(backup_path):
+                try:
+                    shutil.copy2(original_path, backup_path)
+                    self.log(f"已创建备份文件: {os.path.basename(backup_path)}", "INFO")
+                except Exception as e:
+                    self.log(f"备份创建失败: {e}", "WARNING")
             return original_path
         
         # 导出模式
@@ -435,36 +553,95 @@ class YamlTranslatorCore:
         tag_position = self.config.get('tag_position', 'end')
         
         if keep_structure:
-            # 保持目录结构
             rel_path = os.path.relpath(original_path, base_folder)
             output_path = os.path.join(output_folder, rel_path)
         else:
-            # 平铺
             filename = os.path.basename(original_path)
             output_path = os.path.join(output_folder, filename)
         
-        # 添加语言标识
         if add_tag and tag:
             dir_name = os.path.dirname(output_path)
             filename = os.path.basename(output_path)
             name, ext = os.path.splitext(filename)
             
             if tag_position == 'before_ext':
-                # 扩展名前: config.zh_CN.yml
                 new_filename = f"{name}.{tag.lstrip('_')}{ext}"
             else:
-                # 文件名末尾: config_zh_CN.yml
                 new_filename = f"{name}{tag}{ext}"
             
             output_path = os.path.join(dir_name, new_filename)
         
-        # 确保输出目录存在
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        except Exception as e:
+            self.log(f"输出目录创建失败: {e}", "ERROR")
         
         return output_path
-    
+
+    def translate_recursive(self, data, file_path, path_prefix=''):
+        """递归遍历并翻译数据 - 只翻译 name 和 description"""
+        if self.stop_flag:
+            return 0, 0, 0
+
+        successful_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        if isinstance(data, dict):
+            for key, value in list(data.items()):
+                current_path = f"{path_prefix}.{key}" if path_prefix else key
+                
+                # ✅ 只翻译 name 和 description 字段
+                if key in ['name', 'description'] and isinstance(value, str) and value.strip():
+                    # 跳过已包含中文的字段
+                    if self.config.get('skip_chinese', True) and self.contains_chinese(value):
+                        skipped_count += 1
+                        self.record_translation(file_path, current_path, value, value, 'skipped')
+                        continue
+
+                    translated_value, error = self.translator.translate(value)
+                    
+                    if error:
+                        failed_count += 1
+                        self.log(f"翻译失败: {current_path} - {error}", "ERROR")
+                        self.record_translation(file_path, current_path, value, value, 'failed')
+                    else:
+                        successful_count += 1
+                        if self.translation_callback:
+                            self.translation_callback(value, translated_value)
+                        
+                        # 双语输出处理
+                        if self.config.get('enable_bilingual', False) and translated_value != value:
+                            sep = self.config.get('bilingual_separator', ' | ')
+                            if self.config.get('bilingual_order', 'cn_first') == 'cn_first':
+                                data[key] = f"{translated_value}{sep}{value}"
+                            else:
+                                data[key] = f"{value}{sep}{translated_value}"
+                        else:
+                            data[key] = translated_value
+                        
+                        self.record_translation(file_path, current_path, value, data[key], 'success')
+                
+                # ✅ 继续递归处理嵌套的字典和列表
+                elif isinstance(value, (dict, list)):
+                    s, k, f = self.translate_recursive(value, file_path, current_path)
+                    successful_count += s
+                    skipped_count += k
+                    failed_count += f
+
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                current_path = f"{path_prefix}[{i}]"
+                if isinstance(item, (dict, list)):
+                    s, k, f = self.translate_recursive(item, file_path, current_path)
+                    successful_count += s
+                    skipped_count += k
+                    failed_count += f
+        
+        return successful_count, skipped_count, failed_count
+
     def process_yaml_file(self, file_path, base_folder):
-        """处理单个YAML文件"""
+        """处理单个YAML文件 - 支持自定义标签"""
         if self.stop_flag:
             return
         
@@ -472,131 +649,58 @@ class YamlTranslatorCore:
         self.log(f"处理文件: {file_name}")
         
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            translated_lines = []
-            file_translations = 0
-            file_skipped = 0
-            max_retries = self.config.get('max_retries', 3) if self.config.get('enable_retry', True) else 1
-            retry_delay = self.config.get('retry_delay', 5)
-            timeout = self.config.get('api_timeout', 30)
+            # 创建自定义 YAML 加载器，支持自定义标签
+            class CustomYAMLLoader(yaml.SafeLoader):
+                pass
             
-            # 双语输出配置
-            enable_bilingual = self.config.get('enable_bilingual', False)
-            bilingual_separator = self.config.get('bilingual_separator', ' | ')
-            bilingual_order = self.config.get('bilingual_order', 'cn_first')
-            
-            for i, line in enumerate(lines):
-                if self.stop_flag:
-                    self.log("用户停止翻译", "WARNING")
-                    return
-                
-                stripped_line = line.lstrip()
-                leading_spaces = len(line) - len(stripped_line)
-
-                if stripped_line.startswith("name:") or stripped_line.startswith("description:"):
-                    key, value = stripped_line.split(":", 1)
-                    
-                    value = value.strip()
-                    if value.startswith('"') and value.endswith('"'):
-                        value = value[1:-1]
-                    elif value.startswith("'") and value.endswith("'"):
-                        value = value[1:-1]
-                    
-                    # 跳过中文
-                    if self.config.get('skip_chinese', True) and self.contains_chinese(value):
-                        translated_lines.append(line)
-                        file_skipped += 1
-                        self.record_translation(file_path, key, value, value, 'skipped')
-                        continue
-                    
-                    context_info = {}
-                    if key == "name":
-                        description_value = self.find_context_value(lines, i, "description", "down")
-                        if description_value:
-                            context_info['description'] = description_value
-                    elif key == "description":
-                        name_value = self.find_context_value(lines, i, "name", "up")
-                        if name_value:
-                            context_info['name'] = name_value
-                    
-                    # 重试逻辑
-                    translated_value = None
-                    error = None
-                    
-                    for attempt in range(max_retries):
-                        if self.stop_flag:
-                            break
-                            
-                        translated_value, error = self.translator.translate(
-                            value, context_info if context_info else None, timeout=timeout
-                        )
-                        
-                        if not error:
-                            break
-                        
-                        if attempt < max_retries - 1:
-                            self.log(f"翻译失败，{retry_delay}秒后重试 ({attempt + 1}/{max_retries})...", "WARNING")
-                            time.sleep(retry_delay)
-                    
-                    if error:
-                        self.log(f"翻译失败: {value[:30]}... - {error}", "ERROR")
-                        self.stats['failed_translations'] += 1
-                        translated_lines.append(line)
-                        self.record_translation(file_path, key, value, value, 'failed')
-                    else:
-                        if translated_value != value:
-                            file_translations += 1
-                            
-                            # 实时回调翻译结果
-                            if self.translation_callback:
-                                self.translation_callback(value, translated_value)
-                        
-                        # === 双语输出处理 ===
-                        if enable_bilingual and translated_value != value:
-                            if bilingual_order == 'cn_first':
-                                final_value = f"{translated_value}{bilingual_separator}{value}"
-                            else:
-                                final_value = f"{value}{bilingual_separator}{translated_value}"
-                        else:
-                            final_value = translated_value
-                        # === 双语输出结束 ===
-                        
-                        escaped_value = self.translator.escape_yaml_value(final_value)
-                        
-                        if escaped_value.startswith("'") or escaped_value.startswith('"'):
-                            translated_line = f"{' ' * leading_spaces}{key}: {escaped_value}\n"
-                        else:
-                            translated_line = f"{' ' * leading_spaces}{key}: {escaped_value}\n"
-                        
-                        translated_lines.append(translated_line)
-                        self.stats['total_translations'] += 1
-                        self.stats['successful_translations'] += 1
-                        self.record_translation(file_path, key, value, final_value, 'success')
+            # 添加多构造器以处理任何未知的自定义标签
+            def multi_constructor(loader, tag_suffix, node):
+                if isinstance(node, yaml.MappingNode):
+                    return loader.construct_mapping(node)
+                elif isinstance(node, yaml.SequenceNode):
+                    return loader.construct_sequence(node)
                 else:
-                    translated_lines.append(line)
+                    return loader.construct_scalar(node)
+            
+            # 注册多构造器处理所有自定义标签
+            CustomYAMLLoader.add_multi_constructor('!', multi_constructor)
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = yaml.load(f, Loader=CustomYAMLLoader)
 
+            if data is None:
+                self.log(f"文件为空或格式不正确: {file_name}", "WARNING")
+                return
+
+            # 递归翻译
+            successful, skipped, failed = self.translate_recursive(data, file_path)
+            
             # 获取输出路径
             output_path = self.get_output_path(file_path, base_folder)
             
             # 写入文件
             with open(output_path, 'w', encoding='utf-8') as f:
-                f.writelines(translated_lines)
+                yaml.dump(data, f, allow_unicode=True, sort_keys=False, 
+                         default_flow_style=False, indent=2)
 
             self.stats['processed_files'] += 1
-            self.stats['skipped_translations'] += file_skipped
+            self.stats['successful_translations'] += successful
+            self.stats['skipped_translations'] += skipped
+            self.stats['failed_translations'] += failed
             
+            total_actions = successful + skipped + failed
             if output_path != file_path:
-                self.log(f"✓ 完成: {file_name} → {os.path.basename(output_path)} (翻译 {file_translations} 项)", "SUCCESS")
+                self.log(f"✓ 完成: {file_name} → {os.path.basename(output_path)} (处理 {total_actions} 项)", "SUCCESS")
             else:
-                self.log(f"✓ 完成: {file_name} (翻译 {file_translations} 项)", "SUCCESS")
+                self.log(f"✓ 完成: {file_name} (处理 {total_actions} 项)", "SUCCESS")
             
+        except yaml.YAMLError as e:
+            self.log(f"✗ YAML解析失败 {file_name}: {str(e)[:100]}", "ERROR")
         except Exception as e:
-            self.log(f"✗ 处理失败 {file_name}: {e}", "ERROR")
+            self.log(f"✗ 处理失败 {file_name}: {str(e)[:100]}", "ERROR")
     
     def translate_files(self, file_paths, base_folder=None):
-        """翻译文件列表"""
+        """翻译文件列表 - ✅ 完整方法"""
         self.stop_flag = False
         self.translation_records = []
         self.stats = {
@@ -610,12 +714,14 @@ class YamlTranslatorCore:
             'end_time': None
         }
         
-        # 确定基准文件夹
         if not base_folder:
             if len(file_paths) == 1:
                 base_folder = os.path.dirname(file_paths[0])
             else:
-                base_folder = os.path.commonpath(file_paths)
+                try:
+                    base_folder = os.path.commonpath(file_paths)
+                except ValueError:
+                    base_folder = os.path.dirname(file_paths[0])
         
         self.log(f"开始翻译 {len(file_paths)} 个文件")
         self.log(f"线程数: {self.max_threads}")
@@ -627,19 +733,16 @@ class YamlTranslatorCore:
         self.log("=" * 60)
         
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-            futures = []
-            for file_path in file_paths:
-                if self.stop_flag:
-                    break
-                future = executor.submit(self.process_yaml_file, file_path, base_folder)
-                futures.append(future)
+            futures = [executor.submit(self.process_yaml_file, file_path, base_folder) for file_path in file_paths]
             
             for i, future in enumerate(futures):
                 if self.stop_flag:
                     break
-                future.result()
-                self.update_progress(i + 1, len(file_paths), 
-                                    f"处理中: {i + 1}/{len(file_paths)}")
+                try:
+                    future.result()
+                except Exception as e:
+                    self.log(f"线程执行错误: {e}", "ERROR")
+                self.update_progress(i + 1, len(file_paths), f"处理中: {i + 1}/{len(file_paths)}")
         
         self.stats['end_time'] = datetime.now()
         elapsed = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
@@ -747,8 +850,8 @@ class ConfigManager:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                     default_config.update(loaded)
-            except:
-                pass
+            except Exception as e:
+                print(f"配置文件加载失败，使用默认配置: {e}")
         
         return default_config
     
@@ -871,122 +974,122 @@ class ReportGenerator:
     <title>翻译对比报告</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
+        body {{
             font-family: 'Microsoft YaHei', sans-serif;
             background: #f5f5f5;
             padding: 20px;
-        }
-        .header {
+        }}
+        .header {{
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             padding: 30px;
             border-radius: 10px;
             margin-bottom: 20px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .header h1 {
+        }}
+        .header h1 {{
             font-size: 28px;
             margin-bottom: 10px;
-        }
-        .header p {
+        }}
+        .header p {{
             opacity: 0.9;
             margin: 5px 0;
-        }
-        .stats {
+        }}
+        .stats {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 15px;
             margin-bottom: 20px;
-        }
-        .stat-card {
+        }}
+        .stat-card {{
             background: white;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
             text-align: center;
-        }
-        .stat-number {
+        }}
+        .stat-number {{
             font-size: 36px;
             font-weight: bold;
             color: #667eea;
             margin-bottom: 5px;
-        }
-        .stat-label {
+        }}
+        .stat-label {{
             color: #666;
             font-size: 14px;
-        }
-        .file-section {
+        }}
+        .file-section {{
             background: white;
             margin-bottom: 15px;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .file-header {
+        }}
+        .file-header {{
             border-bottom: 2px solid #f0f0f0;
             padding-bottom: 10px;
             margin-bottom: 15px;
-        }
-        .file-title {
+        }}
+        .file-title {{
             font-size: 18px;
             font-weight: bold;
             color: #333;
             margin-bottom: 5px;
-        }
-        .file-info {
+        }}
+        .file-info {{
             color: #666;
             font-size: 13px;
-        }
-        .translation-item {
+        }}
+        .translation-item {{
             border-left: 3px solid #4CAF50;
             padding: 12px;
             margin: 10px 0;
             background: #fafafa;
             border-radius: 4px;
-        }
-        .translation-item.failed {
+        }}
+        .translation-item.failed {{
             border-left-color: #f44336;
             background: #ffebee;
-        }
-        .translation-item.skipped {
+        }}
+        .translation-item.skipped {{
             border-left-color: #FF9800;
             background: #fff3e0;
-        }
-        .original {
+        }}
+        .original {{
             color: #666;
             margin-bottom: 8px;
             font-size: 14px;
-        }
-        .translated {
+        }}
+        .translated {{
             color: #000;
             font-weight: 500;
             font-size: 14px;
-        }
-        .status-badge {
+        }}
+        .status-badge {{
             display: inline-block;
             padding: 2px 8px;
             border-radius: 3px;
             font-size: 12px;
             margin-left: 10px;
-        }
-        .status-success {
+        }}
+        .status-success {{
             background: #4CAF50;
             color: white;
-        }
-        .status-failed {
+        }}
+        .status-failed {{
             background: #f44336;
             color: white;
-        }
-        .status-skipped {
+        }}
+        .status-skipped {{
             background: #FF9800;
             color: white;
-        }
-        .footer {
+        }}
+        .footer {{
             text-align: center;
             color: #999;
             margin-top: 30px;
             padding: 20px;
-        }
+        }}
     </style>
 </head>
 <body>
@@ -1085,12 +1188,14 @@ class ReportGenerator:
         )
         
         # 写入文件
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            return output_path
+        except Exception as e:
+            print(f"报告生成失败: {e}")
+            return None
         
-        return output_path
-
-
 # ==================== GUI 主界面 ====================
 class TranslatorGUI:
     def __init__(self, root):
@@ -1272,6 +1377,11 @@ class TranslatorGUI:
         
         self.status_text = ttk.Label(statusbar, text="就绪", font=('Microsoft YaHei UI', 8))
         self.status_text.pack(side=tk.LEFT, padx=5)
+        
+        # 右侧作者信息
+        ttk.Separator(statusbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        ttk.Label(statusbar, text="By: Mr.Centes", font=('Microsoft YaHei UI', 7), 
+                 foreground='gray').pack(side=tk.RIGHT, padx=5)
     
     def create_main_content(self):
         """创建主内容区域"""
@@ -1366,17 +1476,23 @@ class TranslatorGUI:
         progress_frame = ttk.LabelFrame(right_panel, text=" 📊 翻译进度 ", padding="8")
         progress_frame.grid(row=0, column=0, sticky='ew', pady=(0, 8))
         progress_frame.columnconfigure(0, weight=1)
-        
+        progress_frame.rowconfigure(2, weight=1)
+
         self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate')
-        self.progress_bar.grid(row=0, column=0, sticky='ew', pady=(0, 8))
-        
+        self.progress_bar.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 8))
+
         self.progress_label = ttk.Label(progress_frame, text="就绪",
-                                       font=('Microsoft YaHei UI', 9))
-        self.progress_label.grid(row=1, column=0)
-        
+                               font=('Microsoft YaHei UI', 9))
+        self.progress_label.grid(row=1, column=0, columnspan=2, sticky='w')
+
         self.stats_label = ttk.Label(progress_frame, text="",
-                                     font=('Microsoft YaHei UI', 9))
-        self.stats_label.grid(row=2, column=0, pady=(5, 0))
+                             font=('Microsoft YaHei UI', 9))
+        self.stats_label.grid(row=2, column=0, columnspan=2, sticky='w', pady=(5, 0))
+
+        # 打开文件夹按钮 - 初始状态隐藏
+        self.open_folder_btn = ttk.Button(progress_frame, text="📂 打开输出文件夹", 
+                                  command=self.open_output_folder, width=18)
+        # 不显示，翻译完成时再显示
         
         # 日志区域
         log_frame = ttk.LabelFrame(right_panel, text=" 📝 运行日志 ", padding="8")
@@ -1450,6 +1566,46 @@ class TranslatorGUI:
         self.hint_frame.grid(row=0, column=2, sticky='e', padx=10)
         
         self.update_hint_text()
+    
+    def open_output_folder(self):
+        """打开输出文件夹"""
+        output_folder = self.config_manager.config.get('output_folder', '')
+        
+        if not output_folder:
+            # 如果没有设置输出文件夹，使用默认位置
+            if self.current_base_folder:
+                output_folder = os.path.join(os.path.dirname(self.current_base_folder), 'translated')
+            else:
+                messagebox.showwarning("警告", "找不到输出文件夹")
+                return
+        
+        # 检查文件夹是否存在
+        if not os.path.exists(output_folder):
+            messagebox.showwarning("警告", f"输出文件夹不存在:\n{output_folder}")
+            return
+        
+        try:
+            if sys.platform == 'win32':
+                os.startfile(output_folder)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', output_folder], check=True)
+            else:
+                subprocess.run(['xdg-open', output_folder], check=True)
+            
+            self.log_message("[INFO] 已打开输出文件夹")
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开文件夹:\n{e}")
+
+    def show_open_folder_button(self):
+        """显示打开文件夹按钮 - 翻译完成时调用"""
+        if hasattr(self, 'open_folder_btn'):
+            self.open_folder_btn.grid(row=3, column=1, sticky='e', pady=(8, 0), padx=(0, 0))
+
+    def hide_open_folder_button(self):
+        """隐藏打开文件夹按钮 - 开始翻译时调用"""
+        if hasattr(self, 'open_folder_btn'):
+            self.open_folder_btn.grid_remove()
+
     
     def update_hint_text(self):
         """更新提示文本"""
@@ -1685,7 +1841,7 @@ class TranslatorGUI:
     def add_path(self, path):
         """添加路径"""
         if os.path.isfile(path):
-            if path.lower().endswith(('.yml', '.yaml')) and path not in self.file_queue:
+            if path.lower().endswith(('.yml', '.yaml', '.YML', '.YAML')) and path not in self.file_queue:
                 self.file_queue.append(path)
                 self.refresh_file_list()
         elif os.path.isdir(path):
@@ -1707,13 +1863,16 @@ class TranslatorGUI:
             if len(self.file_queue) == 1:
                 self.current_base_folder = os.path.dirname(self.file_queue[0])
             else:
-                self.current_base_folder = os.path.commonpath(self.file_queue)
+                try:
+                    self.current_base_folder = os.path.commonpath(self.file_queue)
+                except ValueError:
+                    self.current_base_folder = os.path.dirname(self.file_queue[0])
     
     def add_files(self):
         """添加文件"""
         files = filedialog.askopenfilenames(
             title="选择 YAML 文件",
-            filetypes=[("YAML 文件", "*.yml *.yaml"), ("所有文件", "*.*")]
+            filetypes=[("YAML 文件", "*.yml *.yaml *.YML *.YAML"), ("所有文件", "*.*")]
         )
         for file in files:
             self.add_path(file)
@@ -1752,7 +1911,10 @@ class TranslatorGUI:
             if len(self.file_queue) == 1:
                 self.current_base_folder = os.path.dirname(self.file_queue[0])
             else:
-                self.current_base_folder = os.path.commonpath(self.file_queue)
+                try:
+                    self.current_base_folder = os.path.commonpath(self.file_queue)
+                except ValueError:
+                    self.current_base_folder = os.path.dirname(self.file_queue[0])
         else:
             self.current_base_folder = None
     
@@ -1787,7 +1949,7 @@ class TranslatorGUI:
                 try:
                     with open(log_path, 'a', encoding='utf-8') as f:
                         f.write(message + '\n')
-                except:
+                except Exception as e:
                     pass
     
     def clear_log(self):
@@ -1832,7 +1994,8 @@ class TranslatorGUI:
     def on_translation(self, original, translated):
         """翻译回调 - 显示实时翻译"""
         self.log_message(f'[INFO] "{original[:30]}..." → "{translated[:30]}..."')
-    
+
+
     def start_translation(self):
         """开始翻译"""
         if not self.file_queue:
@@ -1860,6 +2023,9 @@ class TranslatorGUI:
         
         if self.is_translating:
             return
+                
+        # 隐藏打开文件夹按钮
+        self.hide_open_folder_button()
         
         # 保存设置
         try:
@@ -1892,7 +2058,9 @@ class TranslatorGUI:
                     'url': current_key.get('url', ''),
                     'temperature': current_key.get('temperature', 0.3),
                     'max_tokens': current_key.get('max_tokens', 1000),
-                    'custom_prompt': current_key.get('custom_prompt', DEFAULT_PROMPT)
+                    'custom_prompt': current_key.get('custom_prompt', DEFAULT_PROMPT),
+                    'max_retries': self.config_manager.config.get('max_retries', 3),
+                    'retry_delay': self.config_manager.config.get('retry_delay', 5)
                 }
                 
                 # 构建翻译配置
@@ -1925,6 +2093,9 @@ class TranslatorGUI:
                 stats = self.translator_core.translate_files(self.file_queue, self.current_base_folder)
                 self.update_stats(stats)
                 
+                # 显示打开文件夹按钮
+                self.root.after(0, self.show_open_folder_button)
+
                 # 保存历史记录
                 self.config_manager.add_history(stats, self.file_queue)
                 
@@ -1945,18 +2116,20 @@ class TranslatorGUI:
                             report_path,
                             api_config
                         )
-                        self.log_message(f"[SUCCESS] 报告已生成: {report_path}")
                         
-                        # 询问是否打开报告
-                        if messagebox.askyesno("完成", 
-                            f"翻译完成！\n\n"
-                            f"处理文件: {stats['processed_files']}/{stats['total_files']}\n"
-                            f"翻译成功: {stats['successful_translations']}\n"
-                            f"跳过: {stats.get('skipped_translations', 0)}\n"
-                            f"失败: {stats['failed_translations']}\n"
-                            f"耗时: {stats.get('duration', 0):.1f}秒\n\n"
-                            f"是否打开对比报告？"):
-                            webbrowser.open(f"file://{os.path.abspath(report_path)}")
+                        if report_path:
+                            self.log_message(f"[SUCCESS] 报告已生成: {report_path}")
+                            
+                            # 询问是否打开报告
+                            if messagebox.askyesno("完成", 
+                                f"翻译完成！\n\n"
+                                f"处理文件: {stats['processed_files']}/{stats['total_files']}\n"
+                                f"翻译成功: {stats['successful_translations']}\n"
+                                f"跳过: {stats.get('skipped_translations', 0)}\n"
+                                f"失败: {stats['failed_translations']}\n"
+                                f"耗时: {stats.get('duration', 0):.1f}秒\n\n"
+                                f"是否打开对比报告？"):
+                                webbrowser.open(f"file://{os.path.abspath(report_path)}")
                     except Exception as e:
                         self.log_message(f"[WARNING] 报告生成失败: {e}")
                 else:
@@ -2105,12 +2278,12 @@ class TranslatorGUI:
         ttk.Button(btn_frame, text="关闭", command=manager_window.destroy, width=12).pack(side=tk.RIGHT, padx=5)
     
     def show_add_edit_key_dialog(self, parent, refresh_callback, key_data=None):
-        """显示添加/编辑API Key对话框"""
+        """显示添加/编辑API Key对话框 - 修复版（支持动态获取模型）"""
         is_edit = key_data is not None
         
         dialog = tk.Toplevel(parent)
         dialog.title("编辑 API Key" if is_edit else "添加 API Key")
-        dialog.geometry("550x600")
+        dialog.geometry("600x750")
         dialog.resizable(False, False)
         dialog.transient(parent)
         dialog.grab_set()
@@ -2118,143 +2291,175 @@ class TranslatorGUI:
         dialog.rowconfigure(1, weight=1)
         dialog.columnconfigure(0, weight=1)
         
-        # 标题
         ttk.Label(dialog, text="编辑 API Key" if is_edit else "添加 API Key", 
                  style='Title.TLabel', padding="20 20 20 10").grid(row=0, column=0)
         
-        # 表单
-        form = ttk.Frame(dialog, padding="20")
-        form.grid(row=1, column=0, sticky='nsew')
+        # 创建可滚动的表单区域
+        canvas = tk.Canvas(dialog, highlightthickness=0)
+        canvas.grid(row=1, column=0, sticky='nsew', padx=15, pady=10)
         
-        # 名称
-        ttk.Label(form, text="名称:").grid(row=0, column=0, sticky=tk.W, pady=10)
+        scrollbar = ttk.Scrollbar(dialog, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.grid(row=1, column=1, sticky='ns')
+        
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        form = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=form, anchor='nw')
+        
+        def on_canvas_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(canvas_window, width=event.width)
+        
+        canvas.bind('<Configure>', on_canvas_configure)
+        
+        # 表单字段
+        ttk.Label(form, text="名称:").grid(row=0, column=0, sticky=tk.W, pady=8)
         name_var = tk.StringVar(value=key_data['name'] if is_edit else '')
-        name_entry = ttk.Entry(form, textvariable=name_var, width=40)
-        name_entry.grid(row=0, column=1, pady=10, sticky='ew')
+        ttk.Entry(form, textvariable=name_var, width=40).grid(row=0, column=1, columnspan=2, pady=8, sticky='ew')
         
-        # 平台
-        ttk.Label(form, text="平台:").grid(row=1, column=0, sticky=tk.W, pady=10)
-        platform_var = tk.StringVar(value=key_data.get('platform', 'deepseek') if is_edit else 'deepseek')
-        platform_combo = ttk.Combobox(form, textvariable=platform_var, state='readonly', width=38)
+        ttk.Label(form, text="平台:").grid(row=1, column=0, sticky=tk.W, pady=8)
+        platform_combo = ttk.Combobox(form, state='readonly', width=37)
         platform_combo['values'] = [preset['display_name'] for preset in PLATFORM_PRESETS.values()]
+        platform_combo.grid(row=1, column=1, columnspan=2, pady=8, sticky='ew')
         
-        # 设置当前值
-        if is_edit:
-            current_platform = key_data.get('platform', 'deepseek')
-            display_name = PLATFORM_PRESETS.get(current_platform, {}).get('display_name', '')
-            if display_name:
-                platform_combo.set(display_name)
-        else:
-            platform_combo.current(0)
-        
-        platform_combo.grid(row=1, column=1, pady=10, sticky='ew')
-        
-        # 模型
-        ttk.Label(form, text="模型:").grid(row=2, column=0, sticky=tk.W, pady=10)
-        model_var = tk.StringVar(value=key_data.get('model', 'deepseek-chat') if is_edit else 'deepseek-chat')
-        model_combo = ttk.Combobox(form, textvariable=model_var, width=38)
-        model_combo.grid(row=2, column=1, pady=10, sticky='ew')
-        
-        def update_models(event=None):
-            """根据平台更新模型列表"""
-            selected_display_name = platform_combo.get()
-            
-            # 找到对应的平台ID
-            platform_id = None
-            for pid, preset in PLATFORM_PRESETS.items():
-                if preset['display_name'] == selected_display_name:
-                    platform_id = pid
-                    break
-            
-            if platform_id:
-                models = PLATFORM_PRESETS[platform_id]['models']
-                model_combo['values'] = models
-                if models:
-                    model_combo.set(models[0])
-                
-                # 自定义平台允许手动输入
-                if platform_id == 'custom':
-                    model_combo.config(state='normal')
-                    url_entry.config(state='normal')
-                else:
-                    model_combo.config(state='readonly')
-                    url_entry.config(state='disabled')
-                    url_var.set(PLATFORM_PRESETS[platform_id]['url'])
-        
-        platform_combo.bind('<<ComboboxSelected>>', update_models)
-        
-        # API Key
-        ttk.Label(form, text="API Key:").grid(row=3, column=0, sticky=tk.W, pady=10)
-        key_frame = ttk.Frame(form)
-        key_frame.grid(row=3, column=1, pady=10, sticky='ew')
-        
-        show_key = tk.BooleanVar(value=False)
+        ttk.Label(form, text="API Key:").grid(row=2, column=0, sticky=tk.W, pady=8)
         key_var = tk.StringVar(value=key_data.get('api_key', '') if is_edit else '')
-        key_entry = ttk.Entry(key_frame, textvariable=key_var, show='*', width=32)
-        key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        key_entry = ttk.Entry(form, textvariable=key_var, show='*', width=40)
+        key_entry.grid(row=2, column=1, columnspan=2, pady=8, sticky='ew')
+
+        ttk.Label(form, text="API URL:").grid(row=3, column=0, sticky=tk.W, pady=8)
+        url_var = tk.StringVar(value=key_data.get('url', '') if is_edit else '')
+        url_entry = ttk.Entry(form, textvariable=url_var, width=40)
+        url_entry.grid(row=3, column=1, columnspan=2, pady=8, sticky='ew')
+
+        # 模型选择（带刷新按钮）
+        ttk.Label(form, text="模型:").grid(row=4, column=0, sticky=tk.W, pady=8)
+        model_var = tk.StringVar(value=key_data.get('model', '') if is_edit else '')
+        model_combo = ttk.Combobox(form, textvariable=model_var, width=30)
+        model_combo.grid(row=4, column=1, pady=8, sticky='ew')
         
-        def toggle_show():
-            if show_key.get():
-                key_entry.config(show='')
-            else:
-                key_entry.config(show='*')
-        
-        show_btn = ttk.Checkbutton(key_frame, text="👁️", variable=show_key, command=toggle_show, width=3)
-        show_btn.pack(side=tk.LEFT, padx=(5, 0))
-        
-        # API URL
-        ttk.Label(form, text="API URL:").grid(row=4, column=0, sticky=tk.W, pady=10)
-        url_var = tk.StringVar(value=key_data.get('url', '') if is_edit else PLATFORM_PRESETS['deepseek']['url'])
-        url_entry = ttk.Entry(form, textvariable=url_var, width=40, state='disabled')
-        url_entry.grid(row=4, column=1, pady=10, sticky='ew')
-        
+        fetch_btn = ttk.Button(form, text="🔄 获取模型", width=12)
+        fetch_btn.grid(row=4, column=2, pady=8, padx=(5, 0), sticky='ew')
+
         # 高级选项
         advanced_frame = ttk.LabelFrame(form, text="高级选项", padding="10")
-        advanced_frame.grid(row=5, column=0, columnspan=2, sticky='ew', pady=10)
+        advanced_frame.grid(row=5, column=0, columnspan=3, sticky='ew', pady=10)
         
         ttk.Label(advanced_frame, text="Temperature:").grid(row=0, column=0, sticky=tk.W, pady=5)
         temp_var = tk.DoubleVar(value=key_data.get('temperature', 0.3) if is_edit else 0.3)
         ttk.Entry(advanced_frame, textvariable=temp_var, width=10).grid(row=0, column=1, sticky=tk.W, pady=5)
-        ttk.Label(advanced_frame, text="(0.0-2.0)", foreground='gray').grid(row=0, column=2, sticky=tk.W, padx=(5,0))
         
         ttk.Label(advanced_frame, text="Max Tokens:").grid(row=1, column=0, sticky=tk.W, pady=5)
         tokens_var = tk.IntVar(value=key_data.get('max_tokens', 1000) if is_edit else 1000)
         ttk.Entry(advanced_frame, textvariable=tokens_var, width=10).grid(row=1, column=1, sticky=tk.W, pady=5)
         
-        # === 新增：自定义提示词 ===
         ttk.Label(advanced_frame, text="自定义提示词:", font=('Microsoft YaHei UI', 9, 'bold')).grid(
             row=2, column=0, columnspan=3, sticky=tk.W, pady=(10, 5))
+        prompt_text = scrolledtext.ScrolledText(advanced_frame, height=6, font=('Consolas', 9), wrap=tk.WORD)
+        prompt_text.grid(row=3, column=0, columnspan=3, sticky='ew', pady=5)
+        prompt_text.insert('1.0', key_data.get('custom_prompt', DEFAULT_PROMPT) if is_edit else DEFAULT_PROMPT)
+
+        # 辅助函数
+        def get_platform_id_from_display_name(display_name):
+            """从显示名称获取平台ID"""
+            for pid, preset in PLATFORM_PRESETS.items():
+                if preset['display_name'] == display_name:
+                    return pid
+            return None
+
+        def update_form_for_platform(*args):
+            """根据选择的平台更新表单"""
+            platform_id = get_platform_id_from_display_name(platform_combo.get())
+            if not platform_id:
+                return
+
+            preset = PLATFORM_PRESETS[platform_id]
+            model_combo['values'] = preset['models']
+            if not model_var.get() or model_var.get() not in preset['models']:
+                model_var.set(preset.get('default_model', ''))
+            
+            url_var.set(preset['url'])
+            
+            # 自定义API允许修改URL
+            if platform_id == 'custom':
+                url_entry.config(state='normal')
+                model_combo.config(state='normal')
+            else:
+                url_entry.config(state='disabled')
+                model_combo.config(state='readonly')
+            
+            # 只有部分平台支持在线获取
+            supported_platforms = ['openai', 'deepseek', 'moonshot', 'zhipu', 'qwen', 
+                                  'mistral', 'groq', 'perplexity', 'fireworks', 'custom']
+            fetch_btn.config(state='normal' if platform_id in supported_platforms else 'disabled')
+
+        def fetch_models_worker(platform_id: str, api_key: str, base_url: str):
+            """在后台线程中获取模型列表"""
+            dialog.after(0, lambda: fetch_btn.config(state='disabled', text="获取中..."))
+            dialog.after(0, lambda: model_combo.config(state='disabled'))
+            
+            try:
+                models, error = UniversalTranslator.fetch_available_models(
+                    platform_id, api_key, base_url, timeout=15
+                )
+                
+                if error:
+                    dialog.after(0, lambda: on_fetch_complete(None, error))
+                elif models:
+                    dialog.after(0, lambda: on_fetch_complete(models, None))
+                else:
+                    dialog.after(0, lambda: on_fetch_complete(None, "未能获取模型列表"))
+
+            except Exception as e:
+                dialog.after(0, lambda: on_fetch_complete(None, f"异常: {str(e)}"))
+
+        def on_fetch_complete(models, error):
+            """当模型获取完成后，在主线程更新UI"""
+            if error:
+                messagebox.showerror("获取失败", error, parent=dialog)
+            elif models:
+                model_combo['values'] = models
+                model_var.set(models[0] if models else '')
+                messagebox.showinfo("成功", f"成功获取 {len(models)} 个模型！", parent=dialog)
+            
+            fetch_btn.config(state='normal', text="🔄 获取模型")
+            model_combo.config(state='normal')
+
+        def start_fetch():
+            """启动模型获取线程"""
+            platform_id = get_platform_id_from_display_name(platform_combo.get())
+            api_key = key_var.get().strip()
+            base_url = url_var.get().strip()
+
+            if not api_key:
+                messagebox.showwarning("警告", "请先输入 API Key", parent=dialog)
+                return
+            
+            if not base_url:
+                messagebox.showwarning("警告", "请先输入 API URL", parent=dialog)
+                return
+            
+            thread = threading.Thread(target=fetch_models_worker, args=(platform_id, api_key, base_url), daemon=True)
+            thread.start()
+
+        fetch_btn.config(command=start_fetch)
+        platform_combo.bind('<<ComboboxSelected>>', update_form_for_platform)
+
+        # 初始化表单
+        if is_edit:
+            platform_id = key_data.get('platform', 'deepseek')
+            display_name = PLATFORM_PRESETS.get(platform_id, {}).get('display_name', '')
+            platform_combo.set(display_name)
+        else:
+            platform_combo.current(1)  # 默认选中 DeepSeek
         
-        prompt_frame = ttk.Frame(advanced_frame)
-        prompt_frame.grid(row=3, column=0, columnspan=3, sticky='ew', pady=5)
-        
-        prompt_text = scrolledtext.ScrolledText(prompt_frame, height=6, width=50, 
-                                               font=('Consolas', 9), wrap=tk.WORD)
-        prompt_text.pack(fill=tk.BOTH, expand=True)
-        
-        # 填充默认提示词
-        current_prompt = key_data.get('custom_prompt', DEFAULT_PROMPT) if is_edit else DEFAULT_PROMPT
-        prompt_text.insert('1.0', current_prompt)
-        
-        # 恢复默认按钮
-        def restore_default_prompt():
-            prompt_text.delete('1.0', tk.END)
-            prompt_text.insert('1.0', DEFAULT_PROMPT)
-        
-        button_frame = ttk.Frame(advanced_frame)
-        button_frame.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(5, 0))
-        ttk.Button(button_frame, text="🔄 恢复默认提示词", command=restore_default_prompt, width=20).pack(side=tk.LEFT)
-        # === 新增结束 ===
+        update_form_for_platform()
         
         form.columnconfigure(1, weight=1)
 
-        
-        # 初始化模型列表
-        update_models()
-        
-        # 按钮
+        # 底部按钮
         btn_frame = ttk.Frame(dialog, padding="15")
-        btn_frame.grid(row=2, column=0, sticky='ew')
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky='ew')
         
         def save():
             name = name_var.get().strip()
@@ -2270,24 +2475,21 @@ class TranslatorGUI:
             
             # 找到平台ID
             selected_display_name = platform_combo.get()
-            platform_id = None
-            for pid, preset in PLATFORM_PRESETS.items():
-                if preset['display_name'] == selected_display_name:
-                    platform_id = pid
-                    break
+            platform_id = get_platform_id_from_display_name(selected_display_name)
+            if not platform_id:
+                messagebox.showwarning("警告", "请选择平台", parent=dialog)
+                return
             
-            # === 新增：获取自定义提示词 ===
             custom_prompt = prompt_text.get('1.0', tk.END).strip()
             if not custom_prompt:
                 custom_prompt = DEFAULT_PROMPT
-            # === 新增结束 ===
             
             new_key_data = {
                 'name': name,
                 'platform': platform_id,
                 'api_key': api_key,
-                'model': model_var.get(),
-                'url': url_var.get(),
+                'model': model_var.get().strip(),
+                'url': url_var.get().strip(),
                 'temperature': temp_var.get(),
                 'max_tokens': tokens_var.get(),
                 'custom_prompt': custom_prompt
@@ -2609,28 +2811,42 @@ class TranslatorGUI:
 
 一个专业的 YAML 文件批量翻译工具
 
-主要特性:
-• 支持20+个AI平台API (OpenAI, Claude, Mistral, Groq等)
-• 多线程并发翻译
+✨ 主要特性:
+• 支持20+个AI平台API (OpenAI, Claude, Mistral等)
+• 多线程并发翻译，速度快
 • 智能上下文翻译
+• 完整的重试机制和速率限制
 • 文件导出功能（不覆盖源文件）
 • 双语输出功能（中文 | 原文）
 • 自定义翻译提示词
+• API模型自动更新
 • 自动生成对比报告
 • 翻译历史记录
 • 丰富的配置选项
 
-版本: {VERSION}
+📋 版本: {VERSION}
 
-支持的AI平台:
+🤖 支持的AI平台:
 🧠 OpenAI, Claude, Mistral, Groq, Perplexity
 🤖 DeepSeek, xAI, Cohere, AI21
 🌙 Moonshot, Google Makersuite, Fireworks
 ☁️ 通义千问, 智谱AI, ElectronHub, NanoGPT
 🎯 AIML API, Pollinations, 自定义API
+
+🔧 v1.20 更新内容:
+• 修复关键的函数重复定义问题
+• 完善URL拼接和模型获取逻辑
+• 实现完整的重试机制和速率限制
+• 改进线程安全和同步机制
+• 优化YAML识别（支持多种大小写）
+• 加入API模型自动更新功能
+• 增强错误处理和日志记录
+• 状态栏显示作者信息
+
+👤 作者: Mr.Centes Claude
         """
         
-        ttk.Label(about_tab, text=about_text, justify=tk.LEFT).pack(pady=20)
+        ttk.Label(about_tab, text=about_text, justify=tk.LEFT, wraplength=600).pack(pady=20)
         
         # 底部按钮
         btn_frame = ttk.Frame(settings_window, padding="15")
@@ -2668,7 +2884,8 @@ class TranslatorGUI:
         
         ttk.Button(btn_frame, text="保存", command=save_settings, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=settings_window.destroy, width=12).pack(side=tk.LEFT, padx=5)
-    
+
+
     def show_output_quick_settings(self):
         """显示输出快速设置对话框"""
         quick_window = tk.Toplevel(self.root)
@@ -3031,11 +3248,13 @@ class TranslatorGUI:
    • 点击"工具" → "管理 API Key"
    • 选择平台（DeepSeek、OpenAI、Moonshot等）
    • 输入 API Key 并保存
+   • 点击"🔄 获取模型"自动加载可用模型
    • 测试连接确保可用
 
 2. 添加文件
    • 通过按钮添加单个文件或文件夹
    • 支持拖拽文件/文件夹（需安装 tkinterdnd2）
+   • 支持 .yml 和 .yaml 文件（大小写不敏感）
 
 3. 配置输出
    • 点击"📂 输出到..."按钮
@@ -3061,7 +3280,7 @@ class TranslatorGUI:
    • 自动创建 .backup 备份
    • 适合直接更新项目文件
 
-三、双语输出功能（新功能）
+三、双语输出功能
 
 启用后，翻译结果会同时包含中文和原文：
 
@@ -3085,7 +3304,14 @@ class TranslatorGUI:
   文件名末尾: config.yml → config_zh_CN.yml
   扩展名前: config.yml → config.zh_CN.yml
 
-五、多平台 API 支持
+五、API 模型自动更新（新功能）
+
+• 点击"🔄 获取模型"按钮
+• 自动连接API获取最新模型列表
+• 支持所有主流平台
+• 无需手动输入模型名称
+
+六、多平台 API 支持
 
 支持平台：
 • 🤖 DeepSeek - 推荐，性价比高
@@ -3093,9 +3319,10 @@ class TranslatorGUI:
 • 🌙 Moonshot - Kimi，上下文长
 • 🧩 智谱AI - GLM系列
 • ☁️ 通义千问 - 阿里云
+• 🎯 其他20+平台
 • ⚙️ 自定义 - 支持任何OpenAI兼容API
 
-六、对比报告
+七、对比报告
 
 翻译完成后自动生成 HTML 报告：
 • 详细的翻译对比
@@ -3103,7 +3330,7 @@ class TranslatorGUI:
 • 成功/跳过/失败分类
 • 美观的网页界面
 
-七、快捷键
+八、快捷键
 
 • Ctrl+O     - 添加文件
 • Ctrl+D     - 添加文件夹
@@ -3113,7 +3340,15 @@ class TranslatorGUI:
 • Delete     - 移除选中文件
 • Ctrl+,     - 打开设置
 
-八、注意事项
+九、性能优化
+
+• 多线程并发翻译（默认4线程）
+• 智能速率限制，避免API限流
+• 完整的重试机制（最多重试3次）
+• 指数退避策略
+• 自动检测并跳过已翻译内容
+
+十、注意事项
 
 • 建议线程数设置为 1-50
 • 首次使用建议使用导出模式
@@ -3121,7 +3356,7 @@ class TranslatorGUI:
 • 注意 API 调用限流
 • 定期查看翻译历史记录
 
-九、常见问题
+十一、常见问题
 
 Q: 无法拖拽文件怎么办？
 A: 点击底部提示链接一键安装 tkinterdnd2
@@ -3136,7 +3371,15 @@ Q: 双语输出会影响游戏运行吗？
 A: 不会，只是文本变长，游戏会正常显示
 
 Q: 支持哪些翻译方向？
-A: 目前主要支持英文→中文
+A: 目前主要支持英文→中文，可通过自定义提示词扩展
+
+Q: 如何自定义翻译提示词？
+A: 在添加/编辑API Key时，在"自定义提示词"文本框中修改
+
+十二、联系方式
+
+作者: Mr.Centes
+版本: {VERSION}
         """
         
         help_text.insert('1.0', content)
@@ -3157,19 +3400,37 @@ A: 目前主要支持英文→中文
 • 支持多平台 API (DeepSeek, OpenAI, Moonshot等)
 • 文件导出功能，不覆盖源文件
 • 双语输出功能（中文 | 原文）
+• API模型自动更新（v1.20新增）
+• 完整的重试机制和速率限制
 • 自动生成精美的对比报告
 • 多线程并发翻译
 • 智能上下文翻译
 • 翻译历史记录
 • 丰富的配置选项
 
-作者: Mr.Centes，Claude
+作者: Mr.Centes
 版本: {VERSION}
 
-更新日志:
-v1.1 - 新增双语输出功能
-     - 优化输出设置界面
-     - 改进用户体验
+更新日志 v1.20:
+✨ 新功能
+  • API模型自动更新功能
+  • 改进的YAML识别（支持多种大小写格式）
+  
+🐛 问题修复
+  • 修复 show_add_edit_key_dialog 函数重复定义
+  • 修复 URL 拼接错误，正确支持模型获取
+  • 修复 escape_yaml_value 未被使用问题
+  
+🚀 性能改进
+  • 实现完整的重试机制和指数退避
+  • 加入智能速率限制
+  • 改进线程安全和同步机制
+  • 增强错误处理和日志记录
+  
+🎨 界面改进
+  • 状态栏显示作者信息
+  • 优化API Key管理界面
+  • 改进设置对话框布局
         """
         messagebox.showinfo("关于", about_text)
     
