@@ -1,4 +1,4 @@
-# YAML批量AI本地化工具 v1.0
+# YAML批量AI本地化工具 v1.10
 
 import os
 import sys
@@ -37,19 +37,11 @@ except ImportError:
     except:
         pass
 
-VERSION = "1.0"
+VERSION = "1.1"
 APP_TITLE = f"YAML批量AI本地化工具 v{VERSION}"
 
 # ==================== 平台预设库 ====================
 PLATFORM_PRESETS = {
-    'deepseek': {
-        'name': 'DeepSeek',
-        'display_name': '🤖 DeepSeek (推荐)',
-        'url': 'https://api.deepseek.com/v1/chat/completions',
-        'models': ['deepseek-chat', 'deepseek-coder'],
-        'default_model': 'deepseek-chat',
-        'docs_url': 'https://platform.deepseek.com/docs'
-    },
     'openai': {
         'name': 'OpenAI',
         'display_name': '🧠 OpenAI (GPT系列)',
@@ -57,6 +49,14 @@ PLATFORM_PRESETS = {
         'models': ['gpt-4-turbo-preview', 'gpt-4', 'gpt-3.5-turbo'],
         'default_model': 'gpt-3.5-turbo',
         'docs_url': 'https://platform.openai.com/docs'
+    },
+    'deepseek': {
+        'name': 'DeepSeek',
+        'display_name': '🤖 DeepSeek (推荐)',
+        'url': 'https://api.deepseek.com/v1/chat/completions',
+        'models': ['deepseek-chat', 'deepseek-coder'],
+        'default_model': 'deepseek-chat',
+        'docs_url': 'https://platform.deepseek.com/docs'
     },
     'moonshot': {
         'name': 'Moonshot',
@@ -82,6 +82,110 @@ PLATFORM_PRESETS = {
         'default_model': 'qwen-turbo',
         'docs_url': 'https://help.aliyun.com/zh/dashscope/'
     },
+    'claude': {
+        'name': 'Claude',
+        'display_name': '🧠 Claude (Anthropic)',
+        'url': 'https://api.anthropic.com/v1/messages',
+        'models': ['claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku'],
+        'default_model': 'claude-3-sonnet',
+        'docs_url': 'https://docs.anthropic.com/claude/reference/getting-started-with-the-api'
+    },
+    'mistral': {
+        'name': 'Mistral',
+        'display_name': '🎯 Mistral AI',
+        'url': 'https://api.mistral.ai/v1/chat/completions',
+        'models': ['mistral-large', 'mistral-medium', 'mistral-small'],
+        'default_model': 'mistral-medium',
+        'docs_url': 'https://docs.mistral.ai/'
+    },
+    'groq': {
+        'name': 'Groq',
+        'display_name': '⚡ Groq',
+        'url': 'https://api.groq.com/openai/v1/chat/completions',
+        'models': ['mixtral-8x7b-32768', 'llama2-70b-4096', 'gemma-7b-it'],
+        'default_model': 'mixtral-8x7b-32768',
+        'docs_url': 'https://console.groq.com/docs/speech-text'
+    },
+    'perplexity': {
+        'name': 'Perplexity',
+        'display_name': '🔍 Perplexity AI',
+        'url': 'https://api.perplexity.ai/chat/completions',
+        'models': ['pplx-7b-online', 'pplx-70b-online', 'pplx-7b', 'pplx-70b'],
+        'default_model': 'pplx-7b-online',
+        'docs_url': 'https://docs.perplexity.ai/'
+    },
+    'cohere': {
+        'name': 'Cohere',
+        'display_name': '📝 Cohere',
+        'url': 'https://api.cohere.ai/v1/chat',
+        'models': ['command-r-plus', 'command-r', 'command-light'],
+        'default_model': 'command-r',
+        'docs_url': 'https://docs.cohere.com/docs/chat-api'
+    },
+    'xai': {
+        'name': 'xAI',
+        'display_name': '✨ xAI (Grok)',
+        'url': 'https://api.x.ai/v1/chat/completions',
+        'models': ['grok-beta'],
+        'default_model': 'grok-beta',
+        'docs_url': 'https://docs.x.ai/'
+    },
+    'fireworks': {
+        'name': 'Fireworks',
+        'display_name': '🔥 Fireworks AI',
+        'url': 'https://api.fireworks.ai/inference/v1/chat/completions',
+        'models': ['llama-v2-7b-chat', 'llama-v2-13b-chat', 'mistral-7b-instruct'],
+        'default_model': 'llama-v2-13b-chat',
+        'docs_url': 'https://docs.fireworks.ai/'
+    },
+    'ai21': {
+        'name': 'AI21',
+        'display_name': '🎨 AI21 Labs',
+        'url': 'https://api.ai21.com/studio/v1/chat/completions',
+        'models': ['j2-ultra', 'j2-mid', 'j2-light'],
+        'default_model': 'j2-mid',
+        'docs_url': 'https://docs.ai21.com/'
+    },
+    'makersuite': {
+        'name': 'Google Makersuite',
+        'display_name': '🔮 Google Makersuite',
+        'url': 'https://generativelanguage.googleapis.com/v1beta/models/generateContent',
+        'models': ['gemini-pro', 'gemini-pro-vision'],
+        'default_model': 'gemini-pro',
+        'docs_url': 'https://ai.google.dev/'
+    },
+    'nanogpt': {
+        'name': 'NanoGPT',
+        'display_name': '⚙️ NanoGPT',
+        'url': 'https://nano-gpt.com/api/v1/chat/completions',
+        'models': ['nano-gpt', 'nano-gpt-large'],
+        'default_model': 'nano-gpt',
+        'docs_url': 'https://nano-gpt.com/docs'
+    },
+    'electronhub': {
+        'name': 'ElectronHub',
+        'display_name': '⚛️ ElectronHub',
+        'url': 'https://api.electronhub.ai/v1/chat/completions',
+        'models': ['electron-v1', 'electron-turbo'],
+        'default_model': 'electron-v1',
+        'docs_url': 'https://electronhub.ai/docs'
+    },
+    'aimlapi': {
+        'name': 'AIML API',
+        'display_name': '🤖 AIML API',
+        'url': 'https://api.aimlapi.com/v1/chat/completions',
+        'models': ['gpt-4', 'gpt-3.5-turbo', 'claude-2'],
+        'default_model': 'gpt-3.5-turbo',
+        'docs_url': 'https://aimlapi.com/docs'
+    },
+    'pollinations': {
+        'name': 'Pollinations',
+        'display_name': '🌸 Pollinations',
+        'url': 'https://text.pollinations.ai/openai/v1/chat/completions',
+        'models': ['openai', 'mistral', 'neural-chat'],
+        'default_model': 'openai',
+        'docs_url': 'https://pollinations.ai/'
+    },
     'custom': {
         'name': 'Custom',
         'display_name': '⚙️ 自定义API',
@@ -92,6 +196,14 @@ PLATFORM_PRESETS = {
     }
 }
 
+# 默认提示词
+DEFAULT_PROMPT = """请将以下英文翻译为中文,如果已经为中文则不翻译。
+
+重要规则：
+1. 只返回翻译结果，不要包含其他内容
+2. 翻译结果中尽量避免使用双引号和单引号
+3. 如果必须使用引号，用中文引号「」『』代替
+4. 避免在翻译结果中使用英文冒号:，使用中文冒号：代替"""
 
 # ==================== 核心翻译器 ====================
 class UniversalTranslator:
@@ -106,7 +218,8 @@ class UniversalTranslator:
                 'model': 'deepseek-chat',
                 'url': 'https://...',
                 'temperature': 0.3,
-                'max_tokens': 1000
+                'max_tokens': 1000,
+                'custom_prompt': '...'
             }
         """
         self.config = api_config
@@ -154,13 +267,8 @@ class UniversalTranslator:
             "Content-Type": "application/json"
         }
 
-        base_prompt = """请将以下英文翻译为中文,如果已经为中文则不翻译。
-
-重要规则：
-1. 只返回翻译结果，不要包含其他内容
-2. 翻译结果中尽量避免使用双引号和单引号
-3. 如果必须使用引号，用中文引号「」『』代替
-4. 避免在翻译结果中使用英文冒号:，使用中文冒号：代替"""
+        # 从配置中获取自定义提示词，如果没有则使用默认提示词
+        base_prompt = self.config.get('custom_prompt', DEFAULT_PROMPT)
 
         if context_info:
             context_parts = []
@@ -199,18 +307,25 @@ class UniversalTranslator:
 
         except Exception as e:
             return text, str(e)
+
     
     def test_connection(self):
         """测试API连接"""
         try:
             test_text = "Hello"
+            start_time = time.time()
             result, error = self.translate(test_text, timeout=10)
+            elapsed = time.time() - start_time
             
             if error:
                 return False, f"翻译失败: {error}"
             
             if result and result != test_text:
-                return True, f"测试成功: \"{test_text}\" → \"{result}\""
+                # 检查响应时间
+                if elapsed > 5:
+                    return True, f"测试成功但响应较慢: \"{test_text}\" → \"{result}\" (耗时 {elapsed:.2f}秒)"
+                else:
+                    return True, f"测试成功: \"{test_text}\" → \"{result}\" (耗时 {elapsed:.2f}秒)"
             else:
                 return False, "API响应异常"
                 
@@ -367,6 +482,11 @@ class YamlTranslatorCore:
             retry_delay = self.config.get('retry_delay', 5)
             timeout = self.config.get('api_timeout', 30)
             
+            # 双语输出配置
+            enable_bilingual = self.config.get('enable_bilingual', False)
+            bilingual_separator = self.config.get('bilingual_separator', ' | ')
+            bilingual_order = self.config.get('bilingual_order', 'cn_first')
+            
             for i, line in enumerate(lines):
                 if self.stop_flag:
                     self.log("用户停止翻译", "WARNING")
@@ -433,7 +553,17 @@ class YamlTranslatorCore:
                             if self.translation_callback:
                                 self.translation_callback(value, translated_value)
                         
-                        escaped_value = self.translator.escape_yaml_value(translated_value)
+                        # === 双语输出处理 ===
+                        if enable_bilingual and translated_value != value:
+                            if bilingual_order == 'cn_first':
+                                final_value = f"{translated_value}{bilingual_separator}{value}"
+                            else:
+                                final_value = f"{value}{bilingual_separator}{translated_value}"
+                        else:
+                            final_value = translated_value
+                        # === 双语输出结束 ===
+                        
+                        escaped_value = self.translator.escape_yaml_value(final_value)
                         
                         if escaped_value.startswith("'") or escaped_value.startswith('"'):
                             translated_line = f"{' ' * leading_spaces}{key}: {escaped_value}\n"
@@ -443,7 +573,7 @@ class YamlTranslatorCore:
                         translated_lines.append(translated_line)
                         self.stats['total_translations'] += 1
                         self.stats['successful_translations'] += 1
-                        self.record_translation(file_path, key, value, translated_value, 'success')
+                        self.record_translation(file_path, key, value, final_value, 'success')
                 else:
                     translated_lines.append(line)
 
@@ -490,6 +620,10 @@ class YamlTranslatorCore:
         self.log(f"开始翻译 {len(file_paths)} 个文件")
         self.log(f"线程数: {self.max_threads}")
         self.log(f"输出模式: {'覆盖源文件' if self.config.get('output_mode') == 'overwrite' else '导出到新文件夹'}")
+        if self.config.get('enable_bilingual', False):
+            order_text = "中文在前" if self.config.get('bilingual_order') == 'cn_first' else "原文在前"
+            sep = self.config.get('bilingual_separator', ' | ')
+            self.log(f"双语输出: 已启用 ({order_text}，分隔符: '{sep}')")
         self.log("=" * 60)
         
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
@@ -559,6 +693,11 @@ class ConfigManager:
             'generate_report': True,
             'report_path': 'auto',
             'conflict_handling': 'ask',
+            
+            # 双语输出设置
+            'enable_bilingual': False,
+            'bilingual_separator': ' | ',
+            'bilingual_order': 'cn_first',  # 'cn_first' 或 'en_first'
             
             # 语言标识预设
             'preset_tags': [
@@ -1274,7 +1413,7 @@ class TranslatorGUI:
         """创建底部控制栏"""
         bottom_frame = ttk.Frame(self.root, padding="10")
         bottom_frame.grid(row=3, column=0, sticky='ew', padx=5, pady=5)
-        bottom_frame.columnconfigure(2, weight=1)  # ← 修改：改为 column=2
+        bottom_frame.columnconfigure(2, weight=1)
         
         # 左侧按钮组
         left_btns = ttk.Frame(bottom_frame)
@@ -1298,7 +1437,6 @@ class TranslatorGUI:
         )
         self.stop_btn.grid(row=0, column=1, padx=(0, 8))
         
-        # ===== 新增：输出设置快捷按钮 =====
         self.output_btn = ttk.Button(
             left_btns,
             text="📂 输出到...",
@@ -1306,11 +1444,10 @@ class TranslatorGUI:
             width=15
         )
         self.output_btn.grid(row=0, column=2)
-        # ===== 新增结束 =====
         
-        # 右侧提示（column 改为 2）
+        # 右侧提示
         self.hint_frame = ttk.Frame(bottom_frame)
-        self.hint_frame.grid(row=0, column=2, sticky='e', padx=10)  # ← 修改：改为 column=2
+        self.hint_frame.grid(row=0, column=2, sticky='e', padx=10)
         
         self.update_hint_text()
     
@@ -1754,7 +1891,8 @@ class TranslatorGUI:
                     'model': current_key.get('model', 'deepseek-chat'),
                     'url': current_key.get('url', ''),
                     'temperature': current_key.get('temperature', 0.3),
-                    'max_tokens': current_key.get('max_tokens', 1000)
+                    'max_tokens': current_key.get('max_tokens', 1000),
+                    'custom_prompt': current_key.get('custom_prompt', DEFAULT_PROMPT)
                 }
                 
                 # 构建翻译配置
@@ -1769,7 +1907,10 @@ class TranslatorGUI:
                     'keep_structure': self.config_manager.config.get('keep_structure', True),
                     'add_language_tag': self.config_manager.config.get('add_language_tag', True),
                     'language_tag': self.config_manager.config.get('language_tag', '_zh_CN'),
-                    'tag_position': self.config_manager.config.get('tag_position', 'end')
+                    'tag_position': self.config_manager.config.get('tag_position', 'end'),
+                    'enable_bilingual': self.config_manager.config.get('enable_bilingual', False),
+                    'bilingual_separator': self.config_manager.config.get('bilingual_separator', ' | '),
+                    'bilingual_order': self.config_manager.config.get('bilingual_order', 'cn_first')
                 }
                 
                 self.translator_core = YamlTranslatorCore(
@@ -2080,7 +2221,33 @@ class TranslatorGUI:
         tokens_var = tk.IntVar(value=key_data.get('max_tokens', 1000) if is_edit else 1000)
         ttk.Entry(advanced_frame, textvariable=tokens_var, width=10).grid(row=1, column=1, sticky=tk.W, pady=5)
         
+        # === 新增：自定义提示词 ===
+        ttk.Label(advanced_frame, text="自定义提示词:", font=('Microsoft YaHei UI', 9, 'bold')).grid(
+            row=2, column=0, columnspan=3, sticky=tk.W, pady=(10, 5))
+        
+        prompt_frame = ttk.Frame(advanced_frame)
+        prompt_frame.grid(row=3, column=0, columnspan=3, sticky='ew', pady=5)
+        
+        prompt_text = scrolledtext.ScrolledText(prompt_frame, height=6, width=50, 
+                                               font=('Consolas', 9), wrap=tk.WORD)
+        prompt_text.pack(fill=tk.BOTH, expand=True)
+        
+        # 填充默认提示词
+        current_prompt = key_data.get('custom_prompt', DEFAULT_PROMPT) if is_edit else DEFAULT_PROMPT
+        prompt_text.insert('1.0', current_prompt)
+        
+        # 恢复默认按钮
+        def restore_default_prompt():
+            prompt_text.delete('1.0', tk.END)
+            prompt_text.insert('1.0', DEFAULT_PROMPT)
+        
+        button_frame = ttk.Frame(advanced_frame)
+        button_frame.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(5, 0))
+        ttk.Button(button_frame, text="🔄 恢复默认提示词", command=restore_default_prompt, width=20).pack(side=tk.LEFT)
+        # === 新增结束 ===
+        
         form.columnconfigure(1, weight=1)
+
         
         # 初始化模型列表
         update_models()
@@ -2109,6 +2276,12 @@ class TranslatorGUI:
                     platform_id = pid
                     break
             
+            # === 新增：获取自定义提示词 ===
+            custom_prompt = prompt_text.get('1.0', tk.END).strip()
+            if not custom_prompt:
+                custom_prompt = DEFAULT_PROMPT
+            # === 新增结束 ===
+            
             new_key_data = {
                 'name': name,
                 'platform': platform_id,
@@ -2116,7 +2289,8 @@ class TranslatorGUI:
                 'model': model_var.get(),
                 'url': url_var.get(),
                 'temperature': temp_var.get(),
-                'max_tokens': tokens_var.get()
+                'max_tokens': tokens_var.get(),
+                'custom_prompt': custom_prompt
             }
             
             if is_edit:
@@ -2205,8 +2379,8 @@ class TranslatorGUI:
         """显示设置对话框"""
         settings_window = tk.Toplevel(self.root)
         settings_window.title("设置")
-        settings_window.geometry("650x650")
-        settings_window.minsize(600, 600)
+        settings_window.geometry("650x700")
+        settings_window.minsize(600, 650)
         settings_window.transient(self.root)
         settings_window.grab_set()
         
@@ -2315,6 +2489,66 @@ class TranslatorGUI:
         language_tag_var.trace('w', update_preview)
         tag_position_var.trace('w', update_preview)
         
+        # 双语输出选项
+        bilingual_frame = ttk.LabelFrame(output_tab, text="双语输出", padding="10")
+        bilingual_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        bilingual_var = tk.BooleanVar(value=self.config_manager.config.get('enable_bilingual', False))
+        ttk.Checkbutton(bilingual_frame, text="启用双语输出（中文 | 原文）", 
+                       variable=bilingual_var).pack(anchor=tk.W, pady=2)
+        
+        # 分隔符选择
+        separator_frame = ttk.Frame(bilingual_frame)
+        separator_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        ttk.Label(separator_frame, text="分隔符:").pack(side=tk.LEFT, padx=(0, 8))
+        separator_var = tk.StringVar(value=self.config_manager.config.get('bilingual_separator', ' | '))
+        
+        separators = [' | ', ' / ', ' - ', ' · ', ' • ']
+        separator_combo = ttk.Combobox(separator_frame, textvariable=separator_var, 
+                                      values=separators, width=10)
+        separator_combo.pack(side=tk.LEFT)
+        
+        # 顺序选择
+        order_frame = ttk.Frame(bilingual_frame)
+        order_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        bilingual_order_var = tk.StringVar(value=self.config_manager.config.get('bilingual_order', 'cn_first'))
+        
+        ttk.Label(order_frame, text="显示顺序:").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(order_frame, text="中文在前", 
+                       variable=bilingual_order_var, value='cn_first').pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(order_frame, text="原文在前", 
+                       variable=bilingual_order_var, value='en_first').pack(side=tk.LEFT)
+        
+        # 预览
+        preview_bilingual = ttk.Frame(bilingual_frame)
+        preview_bilingual.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        preview_bilingual_label = ttk.Label(preview_bilingual, text="", foreground='blue')
+        preview_bilingual_label.pack(side=tk.LEFT)
+        
+        def update_bilingual_preview(*args):
+            if not bilingual_var.get():
+                preview_bilingual_label.config(text='预览: "Items" → "物品"')
+                return
+            
+            sep = separator_var.get()
+            order = bilingual_order_var.get()
+            
+            if order == 'cn_first':
+                result = f'"Items" → "物品{sep}Items"'
+            else:
+                result = f'"Items" → "Items{sep}物品"'
+            
+            preview_bilingual_label.config(text=f'预览: {result}')
+        
+        bilingual_var.trace('w', update_bilingual_preview)
+        separator_var.trace('w', update_bilingual_preview)
+        bilingual_order_var.trace('w', update_bilingual_preview)
+        
+        update_bilingual_preview()
+        
         # 高级选项
         advanced_frame = ttk.LabelFrame(output_tab, text="高级选项", padding="10")
         advanced_frame.pack(fill=tk.X)
@@ -2376,15 +2610,24 @@ class TranslatorGUI:
 一个专业的 YAML 文件批量翻译工具
 
 主要特性:
-• 支持多平台 API (DeepSeek, OpenAI, Moonshot等)
+• 支持20+个AI平台API (OpenAI, Claude, Mistral, Groq等)
 • 多线程并发翻译
 • 智能上下文翻译
 • 文件导出功能（不覆盖源文件）
+• 双语输出功能（中文 | 原文）
+• 自定义翻译提示词
 • 自动生成对比报告
 • 翻译历史记录
 • 丰富的配置选项
 
 版本: {VERSION}
+
+支持的AI平台:
+🧠 OpenAI, Claude, Mistral, Groq, Perplexity
+🤖 DeepSeek, xAI, Cohere, AI21
+🌙 Moonshot, Google Makersuite, Fireworks
+☁️ 通义千问, 智谱AI, ElectronHub, NanoGPT
+🎯 AIML API, Pollinations, 自定义API
         """
         
         ttk.Label(about_tab, text=about_text, justify=tk.LEFT).pack(pady=20)
@@ -2402,6 +2645,11 @@ class TranslatorGUI:
             self.config_manager.config['language_tag'] = language_tag_var.get()
             self.config_manager.config['tag_position'] = tag_position_var.get()
             self.config_manager.config['generate_report'] = generate_report_var.get()
+            
+            # 双语输出设置
+            self.config_manager.config['enable_bilingual'] = bilingual_var.get()
+            self.config_manager.config['bilingual_separator'] = separator_var.get()
+            self.config_manager.config['bilingual_order'] = bilingual_order_var.get()
             
             self.config_manager.config['skip_chinese'] = skip_chinese_var.get()
             self.config_manager.config['max_threads'] = thread_var.get()
@@ -2425,8 +2673,8 @@ class TranslatorGUI:
         """显示输出快速设置对话框"""
         quick_window = tk.Toplevel(self.root)
         quick_window.title("输出设置")
-        quick_window.geometry("550x500")
-        quick_window.minsize(500, 400)  # ← 修改：设置最小尺寸，允许调整大小
+        quick_window.geometry("550x600")
+        quick_window.minsize(500, 500)
         quick_window.transient(self.root)
         quick_window.grab_set()
         
@@ -2438,8 +2686,7 @@ class TranslatorGUI:
         title_frame.grid(row=0, column=0, sticky='ew')
         ttk.Label(title_frame, text="📂 输出设置", style='Title.TLabel').pack(anchor=tk.W)
         
-        # ===== 新增：创建可滚动的主内容区域 =====
-        # 创建Canvas和滚动条容器
+        # 创建可滚动的主内容区域
         scroll_container = ttk.Frame(quick_window)
         scroll_container.grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
         scroll_container.rowconfigure(0, weight=1)
@@ -2462,7 +2709,6 @@ class TranslatorGUI:
         # 绑定Canvas大小变化事件
         def on_canvas_configure(event):
             canvas.configure(scrollregion=canvas.bbox("all"))
-            # 让内容框架宽度跟随Canvas宽度
             canvas.itemconfig(canvas_window, width=event.width)
         
         canvas.bind('<Configure>', on_canvas_configure)
@@ -2478,7 +2724,6 @@ class TranslatorGUI:
             canvas.configure(scrollregion=canvas.bbox("all"))
         
         content.bind('<Configure>', on_content_configure)
-        # ===== 滚动区域设置结束 =====
         
         # 输出模式
         mode_frame = ttk.LabelFrame(content, text="输出模式", padding="10")
@@ -2527,7 +2772,7 @@ class TranslatorGUI:
         
         # 语言标识设置
         tag_frame = ttk.LabelFrame(content, text="语言标识", padding="10")
-        tag_frame.pack(fill=tk.X)
+        tag_frame.pack(fill=tk.X, pady=(0, 15))
         
         add_tag_var = tk.BooleanVar(value=self.config_manager.config.get('add_language_tag', True))
         ttk.Checkbutton(tag_frame, text="添加语言标识到文件名", 
@@ -2591,9 +2836,55 @@ class TranslatorGUI:
         tag_position_var.trace('w', update_preview)
         add_tag_var.trace('w', update_preview)
         
-        update_preview()  # 初始化预览
+        update_preview()
         
-        # 底部按钮（在滚动区域外）
+        # 双语输出
+        bilingual_frame = ttk.LabelFrame(content, text="双语输出", padding="10")
+        bilingual_frame.pack(fill=tk.X)
+        
+        bilingual_var = tk.BooleanVar(value=self.config_manager.config.get('enable_bilingual', False))
+        ttk.Checkbutton(bilingual_frame, text="✨ 启用双语输出（同时显示中文和原文）", 
+                       variable=bilingual_var).pack(anchor=tk.W, pady=5)
+        
+        sep_frame = ttk.Frame(bilingual_frame)
+        sep_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        ttk.Label(sep_frame, text="分隔符:").pack(side=tk.LEFT)
+        separator_var = tk.StringVar(value=self.config_manager.config.get('bilingual_separator', ' | '))
+        ttk.Combobox(sep_frame, textvariable=separator_var, 
+                    values=[' | ', ' / ', ' - ', ' · ', ' • '], width=8).pack(side=tk.LEFT, padx=8)
+        
+        order_frame = ttk.Frame(bilingual_frame)
+        order_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        bilingual_order_var = tk.StringVar(value=self.config_manager.config.get('bilingual_order', 'cn_first'))
+        
+        ttk.Radiobutton(order_frame, text="中文 | 原文", 
+                       variable=bilingual_order_var, value='cn_first').pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(order_frame, text="原文 | 中文", 
+                       variable=bilingual_order_var, value='en_first').pack(side=tk.LEFT)
+        
+        # 预览
+        preview_bi = ttk.Label(bilingual_frame, text="", foreground='blue', font=('Consolas', 9))
+        preview_bi.pack(anchor=tk.W, pady=(10, 0), padx=(20, 0))
+        
+        def update_bi_preview(*args):
+            if not bilingual_var.get():
+                preview_bi.config(text='预览: "Items" → "物品"')
+            else:
+                sep = separator_var.get()
+                order = bilingual_order_var.get()
+                if order == 'cn_first':
+                    preview_bi.config(text=f'预览: "Items" → "物品{sep}Items"')
+                else:
+                    preview_bi.config(text=f'预览: "Items" → "Items{sep}物品"')
+        
+        bilingual_var.trace('w', update_bi_preview)
+        separator_var.trace('w', update_bi_preview)
+        bilingual_order_var.trace('w', update_bi_preview)
+        update_bi_preview()
+        
+        # 底部按钮
         btn_frame = ttk.Frame(quick_window, padding="15")
         btn_frame.grid(row=2, column=0, sticky='ew')
         
@@ -2605,6 +2896,9 @@ class TranslatorGUI:
             self.config_manager.config['add_language_tag'] = add_tag_var.get()
             self.config_manager.config['language_tag'] = language_tag_var.get()
             self.config_manager.config['tag_position'] = tag_position_var.get()
+            self.config_manager.config['enable_bilingual'] = bilingual_var.get()
+            self.config_manager.config['bilingual_separator'] = separator_var.get()
+            self.config_manager.config['bilingual_order'] = bilingual_order_var.get()
             
             self.config_manager.save_config()
             
@@ -2744,10 +3038,11 @@ class TranslatorGUI:
    • 支持拖拽文件/文件夹（需安装 tkinterdnd2）
 
 3. 配置输出
-   • 点击"工具" → "设置" → "输出设置"
+   • 点击"📂 输出到..."按钮
    • 选择输出模式（导出或覆盖）
    • 设置输出文件夹
    • 配置语言标识
+   • 启用双语输出（可选）
 
 4. 开始翻译
    • 点击"开始翻译"按钮
@@ -2766,7 +3061,20 @@ class TranslatorGUI:
    • 自动创建 .backup 备份
    • 适合直接更新项目文件
 
-三、语言标识功能
+三、双语输出功能（新功能）
+
+启用后，翻译结果会同时包含中文和原文：
+
+• 中文在前: "物品 | Items"
+• 原文在前: "Items | 物品"
+• 可选分隔符: | / - · •
+
+适用场景：
+• 游戏Mod翻译（玩家可对照理解）
+• 文档翻译（保留原文参考）
+• 学习用途（中英对照）
+
+四、语言标识功能
 
 • 自动记住最近使用的标识
 • 预设常用标识（_zh_CN、_zh_TW等）
@@ -2777,7 +3085,7 @@ class TranslatorGUI:
   文件名末尾: config.yml → config_zh_CN.yml
   扩展名前: config.yml → config.zh_CN.yml
 
-四、多平台 API 支持
+五、多平台 API 支持
 
 支持平台：
 • 🤖 DeepSeek - 推荐，性价比高
@@ -2787,7 +3095,7 @@ class TranslatorGUI:
 • ☁️ 通义千问 - 阿里云
 • ⚙️ 自定义 - 支持任何OpenAI兼容API
 
-五、对比报告
+六、对比报告
 
 翻译完成后自动生成 HTML 报告：
 • 详细的翻译对比
@@ -2795,7 +3103,7 @@ class TranslatorGUI:
 • 成功/跳过/失败分类
 • 美观的网页界面
 
-六、快捷键
+七、快捷键
 
 • Ctrl+O     - 添加文件
 • Ctrl+D     - 添加文件夹
@@ -2805,7 +3113,7 @@ class TranslatorGUI:
 • Delete     - 移除选中文件
 • Ctrl+,     - 打开设置
 
-七、注意事项
+八、注意事项
 
 • 建议线程数设置为 1-50
 • 首次使用建议使用导出模式
@@ -2813,7 +3121,7 @@ class TranslatorGUI:
 • 注意 API 调用限流
 • 定期查看翻译历史记录
 
-八、常见问题
+九、常见问题
 
 Q: 无法拖拽文件怎么办？
 A: 点击底部提示链接一键安装 tkinterdnd2
@@ -2823,6 +3131,9 @@ A: 检查 API Key、网络连接，开启自动重试
 
 Q: 如何恢复源文件？
 A: 导出模式源文件未修改；覆盖模式可用 .backup 文件
+
+Q: 双语输出会影响游戏运行吗？
+A: 不会，只是文本变长，游戏会正常显示
 
 Q: 支持哪些翻译方向？
 A: 目前主要支持英文→中文
@@ -2845,6 +3156,7 @@ A: 目前主要支持英文→中文
 主要特性:
 • 支持多平台 API (DeepSeek, OpenAI, Moonshot等)
 • 文件导出功能，不覆盖源文件
+• 双语输出功能（中文 | 原文）
 • 自动生成精美的对比报告
 • 多线程并发翻译
 • 智能上下文翻译
@@ -2853,6 +3165,11 @@ A: 目前主要支持英文→中文
 
 作者: Mr.Centes，Claude
 版本: {VERSION}
+
+更新日志:
+v1.1 - 新增双语输出功能
+     - 优化输出设置界面
+     - 改进用户体验
         """
         messagebox.showinfo("关于", about_text)
     
