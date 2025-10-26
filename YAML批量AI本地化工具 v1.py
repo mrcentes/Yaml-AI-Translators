@@ -1,4 +1,4 @@
-# yaml_translator_pro.py - YAML批量AI本地化工具 v1.0
+# YAML批量AI本地化工具 v1.0
 
 import os
 import sys
@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, Menu
-import queue
 
 # ==================== 修复 Windows DPI 模糊问题 ====================
 try:
@@ -31,7 +30,6 @@ try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
 except ImportError:
-    # 检测是否可以安装
     try:
         subprocess.run([sys.executable, "-m", "pip", "--version"], 
                       capture_output=True, check=True)
@@ -42,12 +40,82 @@ except ImportError:
 VERSION = "1.0"
 APP_TITLE = f"YAML批量AI本地化工具 v{VERSION}"
 
+# ==================== 平台预设库 ====================
+PLATFORM_PRESETS = {
+    'deepseek': {
+        'name': 'DeepSeek',
+        'display_name': '🤖 DeepSeek (推荐)',
+        'url': 'https://api.deepseek.com/v1/chat/completions',
+        'models': ['deepseek-chat', 'deepseek-coder'],
+        'default_model': 'deepseek-chat',
+        'docs_url': 'https://platform.deepseek.com/docs'
+    },
+    'openai': {
+        'name': 'OpenAI',
+        'display_name': '🧠 OpenAI (GPT系列)',
+        'url': 'https://api.openai.com/v1/chat/completions',
+        'models': ['gpt-4-turbo-preview', 'gpt-4', 'gpt-3.5-turbo'],
+        'default_model': 'gpt-3.5-turbo',
+        'docs_url': 'https://platform.openai.com/docs'
+    },
+    'moonshot': {
+        'name': 'Moonshot',
+        'display_name': '🌙 Moonshot (Kimi)',
+        'url': 'https://api.moonshot.cn/v1/chat/completions',
+        'models': ['moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k'],
+        'default_model': 'moonshot-v1-8k',
+        'docs_url': 'https://platform.moonshot.cn/docs'
+    },
+    'zhipu': {
+        'name': 'ZhipuAI',
+        'display_name': '🧩 智谱AI (GLM)',
+        'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+        'models': ['glm-4', 'glm-4v', 'glm-3-turbo'],
+        'default_model': 'glm-4',
+        'docs_url': 'https://open.bigmodel.cn/dev/api'
+    },
+    'qwen': {
+        'name': 'Qwen',
+        'display_name': '☁️ 通义千问',
+        'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+        'models': ['qwen-turbo', 'qwen-plus', 'qwen-max'],
+        'default_model': 'qwen-turbo',
+        'docs_url': 'https://help.aliyun.com/zh/dashscope/'
+    },
+    'custom': {
+        'name': 'Custom',
+        'display_name': '⚙️ 自定义API',
+        'url': '',
+        'models': [],
+        'default_model': '',
+        'docs_url': ''
+    }
+}
+
 
 # ==================== 核心翻译器 ====================
-class DeepSeekTranslator:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+class UniversalTranslator:
+    """通用翻译器 - 支持多平台API"""
+    
+    def __init__(self, api_config):
+        """
+        Args:
+            api_config: {
+                'platform': 'deepseek',
+                'api_key': 'sk-xxx',
+                'model': 'deepseek-chat',
+                'url': 'https://...',
+                'temperature': 0.3,
+                'max_tokens': 1000
+            }
+        """
+        self.config = api_config
+        self.platform = api_config.get('platform', 'deepseek')
+        self.api_key = api_config['api_key']
+        self.model = api_config.get('model', 'deepseek-chat')
+        self.base_url = api_config.get('url', PLATFORM_PRESETS.get(self.platform, {}).get('url', ''))
+        self.temperature = api_config.get('temperature', 0.3)
+        self.max_tokens = api_config.get('max_tokens', 1000)
         self.lock = threading.Lock()
         
     def clean_translated_text(self, text):
@@ -80,7 +148,7 @@ class DeepSeekTranslator:
         return text
         
     def translate(self, text, context_info=None, timeout=30):
-        """使用DeepSeek API翻译文本"""
+        """翻译文本"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -110,10 +178,10 @@ class DeepSeekTranslator:
             prompt = f"{base_prompt}\n\n待翻译文本：{text}"
 
         data = {
-            "model": "deepseek-chat",
+            "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 1000
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
         }
 
         try:
@@ -131,22 +199,45 @@ class DeepSeekTranslator:
 
         except Exception as e:
             return text, str(e)
+    
+    def test_connection(self):
+        """测试API连接"""
+        try:
+            test_text = "Hello"
+            result, error = self.translate(test_text, timeout=10)
+            
+            if error:
+                return False, f"翻译失败: {error}"
+            
+            if result and result != test_text:
+                return True, f"测试成功: \"{test_text}\" → \"{result}\""
+            else:
+                return False, "API响应异常"
+                
+        except Exception as e:
+            return False, f"连接失败: {str(e)}"
 
 
 class YamlTranslatorCore:
-    def __init__(self, api_key, max_threads=4, progress_callback=None, log_callback=None, config=None):
-        self.translator = DeepSeekTranslator(api_key)
+    """YAML翻译核心"""
+    
+    def __init__(self, api_config, max_threads=4, progress_callback=None, 
+                 log_callback=None, translation_callback=None, config=None):
+        self.translator = UniversalTranslator(api_config)
         self.max_threads = max_threads
         self.progress_callback = progress_callback
         self.log_callback = log_callback
+        self.translation_callback = translation_callback
         self.config = config or {}
         self.stop_flag = False
+        self.translation_records = []  # 记录翻译详情
         self.stats = {
             'total_files': 0,
             'processed_files': 0,
             'total_translations': 0,
             'successful_translations': 0,
             'failed_translations': 0,
+            'skipped_translations': 0,
             'start_time': None,
             'end_time': None
         }
@@ -164,6 +255,17 @@ class YamlTranslatorCore:
         if self.progress_callback:
             self.progress_callback(current, total, status)
     
+    def record_translation(self, file_path, field_type, original, translated, status):
+        """记录翻译详情"""
+        self.translation_records.append({
+            'file': file_path,
+            'field': field_type,
+            'original': original,
+            'translated': translated,
+            'status': status,  # 'success', 'failed', 'skipped'
+            'timestamp': datetime.now().isoformat()
+        })
+    
     def find_yaml_files(self, path):
         """查找YAML文件"""
         yaml_files = []
@@ -176,19 +278,6 @@ class YamlTranslatorCore:
                     if file.lower().endswith(('.yml', '.yaml')):
                         yaml_files.append(os.path.join(root, file))
         return yaml_files
-    
-    def backup_file(self, file_path):
-        """备份文件"""
-        if not self.config.get('auto_backup', True):
-            return True
-            
-        backup_path = file_path + '.backup'
-        try:
-            shutil.copy2(file_path, backup_path)
-            return True
-        except Exception as e:
-            self.log(f"备份失败 {file_path}: {e}", "WARNING")
-            return False
     
     def contains_chinese(self, text):
         """检查是否包含中文"""
@@ -213,22 +302,68 @@ class YamlTranslatorCore:
                 return value
         return None
     
-    def process_yaml_file(self, file_path):
+    def get_output_path(self, original_path, base_folder):
+        """获取输出文件路径"""
+        output_mode = self.config.get('output_mode', 'export')
+        
+        if output_mode == 'overwrite':
+            return original_path
+        
+        # 导出模式
+        output_folder = self.config.get('output_folder', '')
+        if not output_folder:
+            output_folder = os.path.join(os.path.dirname(original_path), 'translated')
+        
+        keep_structure = self.config.get('keep_structure', True)
+        add_tag = self.config.get('add_language_tag', True)
+        tag = self.config.get('language_tag', '_zh_CN')
+        tag_position = self.config.get('tag_position', 'end')
+        
+        if keep_structure:
+            # 保持目录结构
+            rel_path = os.path.relpath(original_path, base_folder)
+            output_path = os.path.join(output_folder, rel_path)
+        else:
+            # 平铺
+            filename = os.path.basename(original_path)
+            output_path = os.path.join(output_folder, filename)
+        
+        # 添加语言标识
+        if add_tag and tag:
+            dir_name = os.path.dirname(output_path)
+            filename = os.path.basename(output_path)
+            name, ext = os.path.splitext(filename)
+            
+            if tag_position == 'before_ext':
+                # 扩展名前: config.zh_CN.yml
+                new_filename = f"{name}.{tag.lstrip('_')}{ext}"
+            else:
+                # 文件名末尾: config_zh_CN.yml
+                new_filename = f"{name}{tag}{ext}"
+            
+            output_path = os.path.join(dir_name, new_filename)
+        
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        return output_path
+    
+    def process_yaml_file(self, file_path, base_folder):
         """处理单个YAML文件"""
         if self.stop_flag:
             return
         
-        self.log(f"处理文件: {os.path.basename(file_path)}")
+        file_name = os.path.basename(file_path)
+        self.log(f"处理文件: {file_name}")
         
         try:
-            self.backup_file(file_path)
-            
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
             translated_lines = []
             file_translations = 0
-            max_retries = self.config.get('max_retries', 3)
+            file_skipped = 0
+            max_retries = self.config.get('max_retries', 3) if self.config.get('enable_retry', True) else 1
             retry_delay = self.config.get('retry_delay', 5)
             timeout = self.config.get('api_timeout', 30)
             
@@ -249,12 +384,14 @@ class YamlTranslatorCore:
                     elif value.startswith("'") and value.endswith("'"):
                         value = value[1:-1]
                     
+                    # 跳过中文
                     if self.config.get('skip_chinese', True) and self.contains_chinese(value):
                         translated_lines.append(line)
+                        file_skipped += 1
+                        self.record_translation(file_path, key, value, value, 'skipped')
                         continue
                     
                     context_info = {}
-                    
                     if key == "name":
                         description_value = self.find_context_value(lines, i, "description", "down")
                         if description_value:
@@ -287,9 +424,14 @@ class YamlTranslatorCore:
                         self.log(f"翻译失败: {value[:30]}... - {error}", "ERROR")
                         self.stats['failed_translations'] += 1
                         translated_lines.append(line)
+                        self.record_translation(file_path, key, value, value, 'failed')
                     else:
                         if translated_value != value:
                             file_translations += 1
+                            
+                            # 实时回调翻译结果
+                            if self.translation_callback:
+                                self.translation_callback(value, translated_value)
                         
                         escaped_value = self.translator.escape_yaml_value(translated_value)
                         
@@ -301,46 +443,53 @@ class YamlTranslatorCore:
                         translated_lines.append(translated_line)
                         self.stats['total_translations'] += 1
                         self.stats['successful_translations'] += 1
+                        self.record_translation(file_path, key, value, translated_value, 'success')
                 else:
                     translated_lines.append(line)
 
-            with open(file_path, 'w', encoding='utf-8') as f:
+            # 获取输出路径
+            output_path = self.get_output_path(file_path, base_folder)
+            
+            # 写入文件
+            with open(output_path, 'w', encoding='utf-8') as f:
                 f.writelines(translated_lines)
 
             self.stats['processed_files'] += 1
-            self.log(f"✓ 完成: {os.path.basename(file_path)} (翻译 {file_translations} 项)", "SUCCESS")
+            self.stats['skipped_translations'] += file_skipped
             
-            # 自动删除备份
-            if self.config.get('auto_delete_backup', False):
-                backup_path = file_path + '.backup'
-                if os.path.exists(backup_path):
-                    os.remove(backup_path)
+            if output_path != file_path:
+                self.log(f"✓ 完成: {file_name} → {os.path.basename(output_path)} (翻译 {file_translations} 项)", "SUCCESS")
+            else:
+                self.log(f"✓ 完成: {file_name} (翻译 {file_translations} 项)", "SUCCESS")
             
         except Exception as e:
-            self.log(f"✗ 处理失败 {os.path.basename(file_path)}: {e}", "ERROR")
-            backup_path = file_path + '.backup'
-            if os.path.exists(backup_path):
-                try:
-                    shutil.copy2(backup_path, file_path)
-                    self.log(f"已从备份恢复: {os.path.basename(file_path)}", "INFO")
-                except:
-                    pass
+            self.log(f"✗ 处理失败 {file_name}: {e}", "ERROR")
     
-    def translate_files(self, file_paths):
+    def translate_files(self, file_paths, base_folder=None):
         """翻译文件列表"""
         self.stop_flag = False
+        self.translation_records = []
         self.stats = {
             'total_files': len(file_paths),
             'processed_files': 0,
             'total_translations': 0,
             'successful_translations': 0,
             'failed_translations': 0,
+            'skipped_translations': 0,
             'start_time': datetime.now(),
             'end_time': None
         }
         
+        # 确定基准文件夹
+        if not base_folder:
+            if len(file_paths) == 1:
+                base_folder = os.path.dirname(file_paths[0])
+            else:
+                base_folder = os.path.commonpath(file_paths)
+        
         self.log(f"开始翻译 {len(file_paths)} 个文件")
         self.log(f"线程数: {self.max_threads}")
+        self.log(f"输出模式: {'覆盖源文件' if self.config.get('output_mode') == 'overwrite' else '导出到新文件夹'}")
         self.log("=" * 60)
         
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
@@ -348,7 +497,7 @@ class YamlTranslatorCore:
             for file_path in file_paths:
                 if self.stop_flag:
                     break
-                future = executor.submit(self.process_yaml_file, file_path)
+                future = executor.submit(self.process_yaml_file, file_path, base_folder)
                 futures.append(future)
             
             for i, future in enumerate(futures):
@@ -360,11 +509,13 @@ class YamlTranslatorCore:
         
         self.stats['end_time'] = datetime.now()
         elapsed = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
+        self.stats['duration'] = elapsed
         
         self.log("=" * 60)
         self.log(f"翻译完成！", "SUCCESS")
         self.log(f"处理文件: {self.stats['processed_files']}/{self.stats['total_files']}")
         self.log(f"翻译成功: {self.stats['successful_translations']}")
+        self.log(f"跳过项: {self.stats['skipped_translations']}")
         self.log(f"翻译失败: {self.stats['failed_translations']}")
         self.log(f"耗时: {elapsed:.2f}秒")
         
@@ -377,6 +528,8 @@ class YamlTranslatorCore:
 
 # ==================== 配置管理器 ====================
 class ConfigManager:
+    """配置管理器"""
+    
     def __init__(self, config_file="translator_config.json"):
         self.config_file = config_file
         self.config = self.load_config()
@@ -384,25 +537,56 @@ class ConfigManager:
     def load_config(self):
         """加载配置"""
         default_config = {
+            # API Keys
             'api_keys': [],
-            'current_key': '',
+            'current_key_id': None,
+            
+            # 翻译设置
             'max_threads': 4,
-            'auto_backup': True,
             'skip_chinese': True,
-            'auto_delete_backup': False,
             'api_timeout': 30,
             'enable_retry': True,
             'max_retries': 3,
             'retry_delay': 5,
+            
+            # 输出设置
+            'output_mode': 'export',
+            'output_folder': '',
+            'keep_structure': True,
+            'add_language_tag': True,
+            'language_tag': '_zh_CN',
+            'tag_position': 'end',
+            'generate_report': True,
+            'report_path': 'auto',
+            'conflict_handling': 'ask',
+            
+            # 语言标识预设
+            'preset_tags': [
+                {'tag': '_zh_CN', 'label': '简体中文'},
+                {'tag': '_zh_TW', 'label': '繁体中文'},
+                {'tag': '_cn', 'label': '中文简写'},
+                {'tag': '_chinese', 'label': '英文标识'},
+                {'tag': '_translated', 'label': '已翻译'}
+            ],
+            'tag_history': [],
+            'max_tag_history': 10,
+            
+            # UI设置
             'theme': 'light',
             'display_mode': 'simple',
             'sort_mode': 'add_order',
+            
+            # 日志设置
             'log_level': 'standard',
             'auto_save_log': False,
             'log_path': '',
+            
+            # 历史记录
             'save_history': True,
             'max_history': 100,
             'history': [],
+            
+            # 快捷键
             'shortcuts': {
                 'add_files': 'Ctrl+O',
                 'add_folder': 'Ctrl+D',
@@ -412,6 +596,8 @@ class ConfigManager:
                 'remove': 'Delete',
                 'settings': 'Ctrl+comma'
             },
+            
+            # 代理设置
             'proxy_enabled': False,
             'proxy_host': '',
             'proxy_port': 8080
@@ -437,34 +623,76 @@ class ConfigManager:
             print(f"保存配置失败: {e}")
             return False
     
-    def add_api_key(self, key, name=""):
+    def add_api_key(self, key_data):
         """添加API Key"""
-        if not name:
-            name = f"Key {len(self.config['api_keys']) + 1}"
-        
-        key_data = {
-            'key': key,
-            'name': name,
-            'created': datetime.now().isoformat()
-        }
-        
-        for k in self.config['api_keys']:
-            if k['key'] == key:
-                return False
+        key_id = str(int(time.time() * 1000))
+        key_data['id'] = key_id
+        key_data['created'] = datetime.now().isoformat()
+        key_data['last_used'] = None
+        key_data['use_count'] = 0
         
         self.config['api_keys'].append(key_data)
         self.save_config()
-        return True
+        return key_id
     
-    def remove_api_key(self, key):
+    def update_api_key(self, key_id, key_data):
+        """更新API Key"""
+        for i, key in enumerate(self.config['api_keys']):
+            if key['id'] == key_id:
+                key_data['id'] = key_id
+                key_data['created'] = key.get('created', datetime.now().isoformat())
+                self.config['api_keys'][i] = key_data
+                self.save_config()
+                return True
+        return False
+    
+    def remove_api_key(self, key_id):
         """删除API Key"""
-        self.config['api_keys'] = [k for k in self.config['api_keys'] if k['key'] != key]
-        if self.config['current_key'] == key:
-            self.config['current_key'] = ''
+        self.config['api_keys'] = [k for k in self.config['api_keys'] if k['id'] != key_id]
+        if self.config['current_key_id'] == key_id:
+            self.config['current_key_id'] = None
+        self.save_config()
+    
+    def get_api_keys(self):
+        """获取所有API Keys"""
+        return self.config['api_keys']
+    
+    def get_current_key(self):
+        """获取当前使用的Key"""
+        key_id = self.config.get('current_key_id')
+        if key_id:
+            for key in self.config['api_keys']:
+                if key['id'] == key_id:
+                    return key
+        return None
+    
+    def set_current_key(self, key_id):
+        """设置当前使用的Key"""
+        self.config['current_key_id'] = key_id
+        self.save_config()
+    
+    def add_tag_to_history(self, tag):
+        """添加语言标识到历史"""
+        # 移除已存在的
+        self.config['tag_history'] = [
+            item for item in self.config.get('tag_history', [])
+            if item['tag'] != tag
+        ]
+        
+        # 添加到开头
+        self.config['tag_history'].insert(0, {
+            'tag': tag,
+            'last_used': datetime.now().isoformat()
+        })
+        
+        # 限制数量
+        max_history = self.config.get('max_tag_history', 10)
+        self.config['tag_history'] = self.config['tag_history'][:max_history]
+        
         self.save_config()
     
     def add_history(self, stats, files):
-        """添加历史记录"""
+        """添加翻译历史"""
         if not self.config.get('save_history', True):
             return
         
@@ -474,8 +702,9 @@ class ConfigManager:
             'processed_files': stats['processed_files'],
             'successful_translations': stats['successful_translations'],
             'failed_translations': stats['failed_translations'],
-            'duration': (stats['end_time'] - stats['start_time']).total_seconds() if stats['end_time'] else 0,
-            'files': [os.path.basename(f) for f in files[:10]]  # 只保存前10个文件名
+            'skipped_translations': stats.get('skipped_translations', 0),
+            'duration': stats.get('duration', 0),
+            'files': [os.path.basename(f) for f in files[:10]]
         }
         
         if 'history' not in self.config:
@@ -483,11 +712,244 @@ class ConfigManager:
         
         self.config['history'].insert(0, history_item)
         
-        # 限制历史记录数量
         max_history = self.config.get('max_history', 100)
         self.config['history'] = self.config['history'][:max_history]
         
         self.save_config()
+
+
+# ==================== 报告生成器 ====================
+class ReportGenerator:
+    """翻译报告生成器"""
+    
+    @staticmethod
+    def generate_html_report(stats, translation_records, output_path, api_config):
+        """生成HTML对比报告"""
+        html_template = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>翻译对比报告</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        .header p {
+            opacity: 0.9;
+            margin: 5px 0;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .stat-number {
+            font-size: 36px;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+        .stat-label {
+            color: #666;
+            font-size: 14px;
+        }
+        .file-section {
+            background: white;
+            margin-bottom: 15px;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .file-header {
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }
+        .file-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        .file-info {
+            color: #666;
+            font-size: 13px;
+        }
+        .translation-item {
+            border-left: 3px solid #4CAF50;
+            padding: 12px;
+            margin: 10px 0;
+            background: #fafafa;
+            border-radius: 4px;
+        }
+        .translation-item.failed {
+            border-left-color: #f44336;
+            background: #ffebee;
+        }
+        .translation-item.skipped {
+            border-left-color: #FF9800;
+            background: #fff3e0;
+        }
+        .original {
+            color: #666;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .translated {
+            color: #000;
+            font-weight: 500;
+            font-size: 14px;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .status-success {
+            background: #4CAF50;
+            color: white;
+        }
+        .status-failed {
+            background: #f44336;
+            color: white;
+        }
+        .status-skipped {
+            background: #FF9800;
+            color: white;
+        }
+        .footer {
+            text-align: center;
+            color: #999;
+            margin-top: 30px;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🌐 YAML翻译对比报告</h1>
+        <p>生成时间: {timestamp}</p>
+        <p>使用平台: {platform} ({model})</p>
+    </div>
+    
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-number">{total_files}</div>
+            <div class="stat-label">处理文件</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{successful}</div>
+            <div class="stat-label">翻译成功</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{skipped}</div>
+            <div class="stat-label">跳过项</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{failed}</div>
+            <div class="stat-label">失败项</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{duration}</div>
+            <div class="stat-label">总耗时</div>
+        </div>
+    </div>
+    
+    {file_sections}
+    
+    <div class="footer">
+        <p>由 {app_name} 生成</p>
+    </div>
+</body>
+</html>"""
+        
+        # 按文件分组翻译记录
+        files_data = {}
+        for record in translation_records:
+            file_path = record['file']
+            if file_path not in files_data:
+                files_data[file_path] = []
+            files_data[file_path].append(record)
+        
+        # 生成文件区块
+        file_sections_html = ""
+        for file_path, records in files_data.items():
+            file_name = os.path.basename(file_path)
+            
+            success_count = len([r for r in records if r['status'] == 'success'])
+            skipped_count = len([r for r in records if r['status'] == 'skipped'])
+            failed_count = len([r for r in records if r['status'] == 'failed'])
+            
+            items_html = ""
+            for record in records:
+                status_class = record['status']
+                status_text = {'success': '成功', 'failed': '失败', 'skipped': '跳过'}[status_class]
+                status_badge = f'<span class="status-badge status-{status_class}">{status_text}</span>'
+                
+                items_html += f"""
+                <div class="translation-item {status_class}">
+                    <div class="original">{record['field']}: "{record['original']}" {status_badge}</div>
+                    <div class="translated">→ "{record['translated']}"</div>
+                </div>
+                """
+            
+            file_sections_html += f"""
+            <div class="file-section">
+                <div class="file-header">
+                    <div class="file-title">📄 {file_name}</div>
+                    <div class="file-info">路径: {file_path}</div>
+                    <div class="file-info">统计: 成功 {success_count} | 跳过 {skipped_count} | 失败 {failed_count}</div>
+                </div>
+                {items_html}
+            </div>
+            """
+        
+        # 填充模板
+        duration_str = f"{stats.get('duration', 0):.1f}秒"
+        
+        html_content = html_template.format(
+            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            platform=PLATFORM_PRESETS.get(api_config.get('platform', 'deepseek'), {}).get('name', '未知'),
+            model=api_config.get('model', ''),
+            total_files=stats['total_files'],
+            successful=stats['successful_translations'],
+            skipped=stats.get('skipped_translations', 0),
+            failed=stats['failed_translations'],
+            duration=duration_str,
+            file_sections=file_sections_html,
+            app_name=APP_TITLE
+        )
+        
+        # 写入文件
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        return output_path
 
 
 # ==================== GUI 主界面 ====================
@@ -502,7 +964,7 @@ class TranslatorGUI:
         self.translator_core = None
         self.is_translating = False
         self.file_queue = []
-        self.file_info = {}  # 存储文件详细信息
+        self.current_base_folder = None
         
         # 配置样式
         self.setup_styles()
@@ -538,7 +1000,6 @@ class TranslatorGUI:
         elif 'clam' in available_themes:
             self.style.theme_use('clam')
         
-        # 配置自定义样式
         self.style.configure('Accent.TButton', font=('Microsoft YaHei UI', 9, 'bold'))
         self.style.configure('Title.TLabel', font=('Microsoft YaHei UI', 11, 'bold'))
         self.style.configure('TLabelframe', font=('Microsoft YaHei UI', 9))
@@ -549,7 +1010,6 @@ class TranslatorGUI:
         theme = self.config_manager.config.get('theme', 'light')
         
         if theme == 'dark':
-            # 暗色主题配色
             bg = '#2b2b2b'
             fg = '#e0e0e0'
             select_bg = '#4a9eff'
@@ -560,13 +1020,11 @@ class TranslatorGUI:
             self.style.configure('TLabelframe', background=bg, foreground=fg)
             self.style.configure('TLabelframe.Label', background=bg, foreground=fg)
             
-            # 更新文本控件颜色
             if hasattr(self, 'log_text'):
                 self.log_text.configure(bg='#1e1e1e', fg=fg, insertbackground=fg)
             if hasattr(self, 'file_listbox'):
                 self.file_listbox.configure(bg='#1e1e1e', fg=fg, selectbackground=select_bg)
         else:
-            # 亮色主题（默认）
             self.root.configure(bg='SystemButtonFace')
             self.style.configure('TFrame', background='SystemButtonFace')
             self.style.configure('TLabel', background='SystemButtonFace', foreground='black')
@@ -591,13 +1049,6 @@ class TranslatorGUI:
         file_menu.add_command(label="导出日志", command=self.export_log)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_closing)
-        
-        # 备份菜单
-        backup_menu = Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="备份(B)", menu=backup_menu)
-        backup_menu.add_command(label="恢复所有备份", command=self.restore_all_backups)
-        backup_menu.add_command(label="清理所有备份", command=self.cleanup_all_backups)
-        backup_menu.add_command(label="查看备份文件...", command=self.view_backups)
         
         # 工具菜单
         tools_menu = Menu(menubar, tearoff=0)
@@ -662,29 +1113,24 @@ class TranslatorGUI:
         statusbar = ttk.Frame(self.root, relief=tk.SUNKEN, padding="5 2")
         statusbar.grid(row=1, column=0, sticky='ew', padx=5)
         
-        # 版本
         ttk.Label(statusbar, text=f"v{VERSION}", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT, padx=5)
         ttk.Separator(statusbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         
-        # API 状态
         self.api_status_label = ttk.Label(statusbar, text="🔴 API未配置", 
                                          font=('Microsoft YaHei UI', 8))
         self.api_status_label.pack(side=tk.LEFT, padx=5)
         ttk.Separator(statusbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         
-        # 拖拽状态
         dnd_status = "🟢 拖拽: 可用" if HAS_DND else "🔴 拖拽: 不可用"
         ttk.Label(statusbar, text=dnd_status, font=('Microsoft YaHei UI', 8)).pack(
             side=tk.LEFT, padx=5)
         ttk.Separator(statusbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         
-        # 文件数
         self.file_count_status = ttk.Label(statusbar, text="文件: 0", 
                                           font=('Microsoft YaHei UI', 8))
         self.file_count_status.pack(side=tk.LEFT, padx=5)
         ttk.Separator(statusbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         
-        # 状态文本
         self.status_text = ttk.Label(statusbar, text="就绪", font=('Microsoft YaHei UI', 8))
         self.status_text.pack(side=tk.LEFT, padx=5)
     
@@ -697,7 +1143,7 @@ class TranslatorGUI:
         main_container.columnconfigure(0, weight=1)
         main_container.columnconfigure(1, weight=1)
         
-        # 左侧面板 - 文件管理
+        # 左侧面板
         left_panel = ttk.LabelFrame(main_container, text=" 📁 待翻译文件 ", padding="8")
         left_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
         left_panel.rowconfigure(1, weight=1)
@@ -743,10 +1189,8 @@ class TranslatorGUI:
         self.file_listbox.grid(row=0, column=0, sticky='nsew')
         scrollbar.config(command=self.file_listbox.yview)
         
-        # 绑定右键菜单
         self.file_listbox.bind("<Button-3>", self.show_context_menu)
         
-        # 启用拖拽
         if HAS_DND:
             self.file_listbox.drop_target_register(DND_FILES)
             self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
@@ -768,13 +1212,12 @@ class TranslatorGUI:
         ttk.Button(file_btn_frame, text="❌ 移除", command=self.remove_selected).grid(
             row=0, column=3, padx=2, sticky='ew')
         
-        # 文件统计
         self.file_count_label = ttk.Label(left_panel, text="已选择: 0 个文件",
                                          font=('Microsoft YaHei UI', 9, 'bold'),
                                          foreground='#0066cc')
         self.file_count_label.grid(row=3, column=0, sticky='w')
         
-        # 右侧面板 - 进度和日志
+        # 右侧面板
         right_panel = ttk.Frame(main_container)
         right_panel.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
         right_panel.rowconfigure(1, weight=1)
@@ -812,13 +1255,11 @@ class TranslatorGUI:
         )
         self.log_text.grid(row=0, column=0, sticky='nsew', pady=(0, 8))
         
-        # 配置日志颜色标签
         self.log_text.tag_config("INFO", foreground="#333333")
         self.log_text.tag_config("SUCCESS", foreground="#008000", font=('Consolas', 9, 'bold'))
         self.log_text.tag_config("WARNING", foreground="#FF8C00", font=('Consolas', 9, 'bold'))
         self.log_text.tag_config("ERROR", foreground="#DC143C", font=('Consolas', 9, 'bold'))
         
-        # 日志操作按钮
         log_btn_frame = ttk.Frame(log_frame)
         log_btn_frame.grid(row=1, column=0, sticky='ew')
         log_btn_frame.columnconfigure(0, weight=1)
@@ -833,7 +1274,7 @@ class TranslatorGUI:
         """创建底部控制栏"""
         bottom_frame = ttk.Frame(self.root, padding="10")
         bottom_frame.grid(row=3, column=0, sticky='ew', padx=5, pady=5)
-        bottom_frame.columnconfigure(1, weight=1)
+        bottom_frame.columnconfigure(2, weight=1)  # ← 修改：改为 column=2
         
         # 左侧按钮组
         left_btns = ttk.Frame(bottom_frame)
@@ -855,11 +1296,21 @@ class TranslatorGUI:
             state=tk.DISABLED,
             width=15
         )
-        self.stop_btn.grid(row=0, column=1)
+        self.stop_btn.grid(row=0, column=1, padx=(0, 8))
         
-        # 右侧提示
+        # ===== 新增：输出设置快捷按钮 =====
+        self.output_btn = ttk.Button(
+            left_btns,
+            text="📂 输出到...",
+            command=self.show_output_quick_settings,
+            width=15
+        )
+        self.output_btn.grid(row=0, column=2)
+        # ===== 新增结束 =====
+        
+        # 右侧提示（column 改为 2）
         self.hint_frame = ttk.Frame(bottom_frame)
-        self.hint_frame.grid(row=0, column=2, sticky='e', padx=10)
+        self.hint_frame.grid(row=0, column=2, sticky='e', padx=10)  # ← 修改：改为 column=2
         
         self.update_hint_text()
     
@@ -887,8 +1338,6 @@ class TranslatorGUI:
     
     def bind_shortcuts(self):
         """绑定快捷键"""
-        shortcuts = self.config_manager.config.get('shortcuts', {})
-        
         self.root.bind('<Control-o>', lambda e: self.add_files())
         self.root.bind('<Control-d>', lambda e: self.add_folder())
         self.root.bind('<F5>', lambda e: self.start_translation())
@@ -899,15 +1348,19 @@ class TranslatorGUI:
     
     def load_settings(self):
         """加载设置"""
-        keys = self.config_manager.config.get('api_keys', [])
+        keys = self.config_manager.get_api_keys()
         if keys:
-            key_names = [f"{k['name']} ({k['key'][:10]}...)" for k in keys]
+            key_names = []
+            for k in keys:
+                platform_name = PLATFORM_PRESETS.get(k.get('platform', 'custom'), {}).get('name', '自定义')
+                key_names.append(f"{k['name']} ({platform_name})")
+            
             self.key_combo['values'] = key_names
             
-            current_key = self.config_manager.config.get('current_key', '')
+            current_key = self.config_manager.get_current_key()
             if current_key:
                 for i, k in enumerate(keys):
-                    if k['key'] == current_key:
+                    if k['id'] == current_key['id']:
                         self.key_combo.current(i)
                         self.api_status_label.config(text="🟢 API已连接")
                         break
@@ -930,19 +1383,18 @@ class TranslatorGUI:
         }
         self.sort_mode.set(sort_map.get(sort_mode, '按添加顺序'))
     
-    # ==================== 事件处理函数 ====================
+    # ==================== 事件处理 ====================
     
     def on_key_selected(self, event):
         """选择API Key"""
         index = self.key_combo.current()
         if index >= 0:
-            keys = self.config_manager.config.get('api_keys', [])
-            self.config_manager.config['current_key'] = keys[index]['key']
-            self.config_manager.save_config()
+            keys = self.config_manager.get_api_keys()
+            self.config_manager.set_current_key(keys[index]['id'])
             self.api_status_label.config(text="🟢 API已连接")
     
     def on_drop(self, event):
-        """处理拖拽事件"""
+        """处理拖拽"""
         files = self.root.tk.splitlist(event.data)
         for file_path in files:
             file_path = file_path.strip('{}')
@@ -957,7 +1409,6 @@ class TranslatorGUI:
         menu = Menu(self.root, tearoff=0)
         
         if len(selection) == 1:
-            # 单选
             menu.add_command(label="📂 打开文件位置", command=self.open_file_location)
             menu.add_command(label="📝 用编辑器打开", command=self.open_with_editor)
             menu.add_command(label="📋 复制文件路径", command=self.copy_file_path)
@@ -965,7 +1416,6 @@ class TranslatorGUI:
             menu.add_separator()
             menu.add_command(label="❌ 从列表移除", command=self.remove_selected)
         else:
-            # 多选
             menu.add_command(label="📂 打开文件位置", command=self.open_file_location)
             menu.add_command(label=f"📋 复制路径({len(selection)}个)", command=self.copy_file_path)
             menu.add_separator()
@@ -1050,7 +1500,7 @@ class TranslatorGUI:
         sort_mode = self.config_manager.config.get('sort_mode', 'add_order')
         
         if sort_mode == 'add_order':
-            return  # 保持原顺序
+            return
         
         if sort_mode == 'name_asc':
             self.file_queue.sort(key=lambda x: os.path.basename(x).lower())
@@ -1077,7 +1527,7 @@ class TranslatorGUI:
                 size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                 size_str = self.format_size(size)
                 text = f"{name}  |  {size_str}"
-            else:  # ultra
+            else:
                 name = os.path.basename(file_path)
                 size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                 size_str = self.format_size(size)
@@ -1102,7 +1552,7 @@ class TranslatorGUI:
                 self.file_queue.append(path)
                 self.refresh_file_list()
         elif os.path.isdir(path):
-            core = YamlTranslatorCore("", 1)
+            core = YamlTranslatorCore({'api_key': '', 'platform': 'deepseek'}, 1)
             yaml_files = core.find_yaml_files(path)
             added = 0
             for f in yaml_files:
@@ -1114,6 +1564,13 @@ class TranslatorGUI:
                 self.log_message(f"[INFO] 从文件夹添加了 {added} 个 YAML 文件")
         
         self.update_file_count()
+        
+        # 更新基准文件夹
+        if self.file_queue:
+            if len(self.file_queue) == 1:
+                self.current_base_folder = os.path.dirname(self.file_queue[0])
+            else:
+                self.current_base_folder = os.path.commonpath(self.file_queue)
     
     def add_files(self):
         """添加文件"""
@@ -1141,7 +1598,7 @@ class TranslatorGUI:
         
         self.file_listbox.delete(0, tk.END)
         self.file_queue.clear()
-        self.file_info.clear()
+        self.current_base_folder = None
         self.update_file_count()
         self.log_message("[INFO] 已清空文件列表")
     
@@ -1152,6 +1609,15 @@ class TranslatorGUI:
             self.file_listbox.delete(index)
             self.file_queue.pop(index)
         self.update_file_count()
+        
+        # 更新基准文件夹
+        if self.file_queue:
+            if len(self.file_queue) == 1:
+                self.current_base_folder = os.path.dirname(self.file_queue[0])
+            else:
+                self.current_base_folder = os.path.commonpath(self.file_queue)
+        else:
+            self.current_base_folder = None
     
     def update_file_count(self):
         """更新文件计数"""
@@ -1163,7 +1629,6 @@ class TranslatorGUI:
         """显示日志"""
         self.log_text.insert(tk.END, message + "\n")
         
-        # 根据日志级别设置颜色
         if "[ERROR]" in message:
             tag = "ERROR"
         elif "[WARNING]" in message:
@@ -1173,14 +1638,12 @@ class TranslatorGUI:
         else:
             tag = "INFO"
         
-        # 获取最后一行
         last_line = self.log_text.index("end-1c linestart")
         self.log_text.tag_add(tag, last_line, "end-1c")
         
         self.log_text.see(tk.END)
         self.root.update_idletasks()
         
-        # 自动保存日志
         if self.config_manager.config.get('auto_save_log', False):
             log_path = self.config_manager.config.get('log_path', '')
             if log_path:
@@ -1225,8 +1688,13 @@ class TranslatorGUI:
         if stats:
             text = (f"总翻译: {stats['total_translations']} | "
                    f"成功: {stats['successful_translations']} | "
+                   f"跳过: {stats.get('skipped_translations', 0)} | "
                    f"失败: {stats['failed_translations']}")
             self.stats_label.config(text=text)
+    
+    def on_translation(self, original, translated):
+        """翻译回调 - 显示实时翻译"""
+        self.log_message(f'[INFO] "{original[:30]}..." → "{translated[:30]}..."')
     
     def start_translation(self):
         """开始翻译"""
@@ -1234,10 +1702,24 @@ class TranslatorGUI:
             messagebox.showwarning("警告", "请先添加要翻译的文件")
             return
         
-        current_key = self.config_manager.config.get('current_key', '')
+        current_key = self.config_manager.get_current_key()
         if not current_key:
             messagebox.showwarning("警告", "请先选择或添加 API Key")
             return
+        
+        # 检查输出设置
+        output_mode = self.config_manager.config.get('output_mode', 'export')
+        if output_mode == 'export':
+            output_folder = self.config_manager.config.get('output_folder', '')
+            if not output_folder:
+                # 询问输出文件夹
+                if not messagebox.askyesno("提示", 
+                    "未设置输出文件夹，将使用默认位置\n（源文件夹下的 'translated' 文件夹）\n\n是否继续？"):
+                    return
+        elif output_mode == 'overwrite':
+            if not messagebox.askyesno("⚠️ 警告", 
+                "覆盖模式将直接修改源文件！\n虽然会创建备份，但仍有风险。\n\n确定要继续吗？"):
+                return
         
         if self.is_translating:
             return
@@ -1250,6 +1732,12 @@ class TranslatorGUI:
         except:
             thread_count = 4
         
+        # 保存语言标识到历史
+        if self.config_manager.config.get('add_language_tag', False):
+            tag = self.config_manager.config.get('language_tag', '_zh_CN')
+            if tag:
+                self.config_manager.add_tag_to_history(tag)
+        
         self.is_translating = True
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -1259,39 +1747,87 @@ class TranslatorGUI:
         # 在新线程中执行翻译
         def translate_thread():
             try:
-                # 获取配置
-                config = {
-                    'auto_backup': self.config_manager.config.get('auto_backup', True),
+                # 构建API配置
+                api_config = {
+                    'platform': current_key.get('platform', 'deepseek'),
+                    'api_key': current_key['api_key'],
+                    'model': current_key.get('model', 'deepseek-chat'),
+                    'url': current_key.get('url', ''),
+                    'temperature': current_key.get('temperature', 0.3),
+                    'max_tokens': current_key.get('max_tokens', 1000)
+                }
+                
+                # 构建翻译配置
+                translate_config = {
                     'skip_chinese': self.config_manager.config.get('skip_chinese', True),
-                    'auto_delete_backup': self.config_manager.config.get('auto_delete_backup', False),
                     'api_timeout': self.config_manager.config.get('api_timeout', 30),
-                    'max_retries': self.config_manager.config.get('max_retries', 3) if self.config_manager.config.get('enable_retry', True) else 1,
-                    'retry_delay': self.config_manager.config.get('retry_delay', 5)
+                    'enable_retry': self.config_manager.config.get('enable_retry', True),
+                    'max_retries': self.config_manager.config.get('max_retries', 3),
+                    'retry_delay': self.config_manager.config.get('retry_delay', 5),
+                    'output_mode': self.config_manager.config.get('output_mode', 'export'),
+                    'output_folder': self.config_manager.config.get('output_folder', ''),
+                    'keep_structure': self.config_manager.config.get('keep_structure', True),
+                    'add_language_tag': self.config_manager.config.get('add_language_tag', True),
+                    'language_tag': self.config_manager.config.get('language_tag', '_zh_CN'),
+                    'tag_position': self.config_manager.config.get('tag_position', 'end')
                 }
                 
                 self.translator_core = YamlTranslatorCore(
-                    current_key,
+                    api_config,
                     max_threads=thread_count,
                     progress_callback=self.update_progress_ui,
                     log_callback=self.log_message,
-                    config=config
+                    translation_callback=self.on_translation,
+                    config=translate_config
                 )
                 
-                stats = self.translator_core.translate_files(self.file_queue)
+                stats = self.translator_core.translate_files(self.file_queue, self.current_base_folder)
                 self.update_stats(stats)
                 
                 # 保存历史记录
                 self.config_manager.add_history(stats, self.file_queue)
                 
-                # 显示完成消息
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "翻译完成",
-                    f"翻译完成！\n\n"
-                    f"处理文件: {stats['processed_files']}/{stats['total_files']}\n"
-                    f"翻译成功: {stats['successful_translations']}\n"
-                    f"翻译失败: {stats['failed_translations']}\n"
-                    f"耗时: {stats.get('duration', 0):.1f}秒"
-                ))
+                # 生成报告
+                if self.config_manager.config.get('generate_report', True):
+                    try:
+                        report_path = self.config_manager.config.get('report_path', 'auto')
+                        if report_path == 'auto':
+                            output_folder = self.config_manager.config.get('output_folder', '')
+                            if not output_folder:
+                                output_folder = os.path.join(os.path.dirname(self.file_queue[0]), 'translated')
+                            report_path = os.path.join(output_folder, 
+                                f"translation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+                        
+                        report_path = ReportGenerator.generate_html_report(
+                            stats, 
+                            self.translator_core.translation_records,
+                            report_path,
+                            api_config
+                        )
+                        self.log_message(f"[SUCCESS] 报告已生成: {report_path}")
+                        
+                        # 询问是否打开报告
+                        if messagebox.askyesno("完成", 
+                            f"翻译完成！\n\n"
+                            f"处理文件: {stats['processed_files']}/{stats['total_files']}\n"
+                            f"翻译成功: {stats['successful_translations']}\n"
+                            f"跳过: {stats.get('skipped_translations', 0)}\n"
+                            f"失败: {stats['failed_translations']}\n"
+                            f"耗时: {stats.get('duration', 0):.1f}秒\n\n"
+                            f"是否打开对比报告？"):
+                            webbrowser.open(f"file://{os.path.abspath(report_path)}")
+                    except Exception as e:
+                        self.log_message(f"[WARNING] 报告生成失败: {e}")
+                else:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "翻译完成",
+                        f"翻译完成！\n\n"
+                        f"处理文件: {stats['processed_files']}/{stats['total_files']}\n"
+                        f"翻译成功: {stats['successful_translations']}\n"
+                        f"跳过: {stats.get('skipped_translations', 0)}\n"
+                        f"失败: {stats['failed_translations']}\n"
+                        f"耗时: {stats.get('duration', 0):.1f}秒"
+                    ))
                 
             except Exception as e:
                 self.log_message(f"[ERROR] 翻译过程出错: {e}")
@@ -1316,10 +1852,11 @@ class TranslatorGUI:
     
     def show_key_manager(self):
         """显示API Key管理窗口"""
+        # 创建管理窗口
         manager_window = tk.Toplevel(self.root)
         manager_window.title("API Key 管理")
-        manager_window.geometry("700x450")
-        manager_window.minsize(600, 400)
+        manager_window.geometry("800x500")
+        manager_window.minsize(700, 450)
         manager_window.transient(self.root)
         manager_window.grab_set()
         
@@ -1337,15 +1874,17 @@ class TranslatorGUI:
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
         
-        columns = ('name', 'key', 'created')
+        columns = ('name', 'platform', 'model', 'status')
         tree = ttk.Treeview(list_frame, columns=columns, show='headings')
         tree.heading('name', text='名称')
-        tree.heading('key', text='API Key')
-        tree.heading('created', text='创建时间')
+        tree.heading('platform', text='平台')
+        tree.heading('model', text='模型')
+        tree.heading('status', text='状态')
         
         tree.column('name', width=150)
-        tree.column('key', width=300)
-        tree.column('created', width=180)
+        tree.column('platform', width=150)
+        tree.column('model', width=200)
+        tree.column('status', width=100)
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscroll=scrollbar.set)
@@ -1355,10 +1894,14 @@ class TranslatorGUI:
         
         def refresh_tree():
             tree.delete(*tree.get_children())
-            for k in self.config_manager.config.get('api_keys', []):
-                masked_key = k['key'][:10] + "..." + k['key'][-8:]
-                created = k.get('created', 'N/A')[:19] if 'created' in k else "未知"
-                tree.insert('', tk.END, values=(k['name'], masked_key, created))
+            for k in self.config_manager.get_api_keys():
+                platform_name = PLATFORM_PRESETS.get(k.get('platform', 'custom'), {}).get('name', '自定义')
+                tree.insert('', tk.END, values=(
+                    k['name'], 
+                    platform_name, 
+                    k.get('model', 'N/A'),
+                    '⚠ 未测试'
+                ))
         
         refresh_tree()
         
@@ -1367,53 +1910,21 @@ class TranslatorGUI:
         btn_frame.grid(row=2, column=0, sticky='ew')
         
         def add_key():
-            add_window = tk.Toplevel(manager_window)
-            add_window.title("添加 API Key")
-            add_window.geometry("500x200")
-            add_window.resizable(False, False)
-            add_window.transient(manager_window)
-            add_window.grab_set()
+            self.show_add_edit_key_dialog(manager_window, refresh_tree)
+        
+        def edit_key():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("警告", "请选择要编辑的 API Key", parent=manager_window)
+                return
             
-            add_window.rowconfigure(0, weight=1)
-            add_window.columnconfigure(0, weight=1)
+            item = tree.item(selection[0])
+            key_name = item['values'][0]
             
-            form = ttk.Frame(add_window, padding="20")
-            form.grid(row=0, column=0, sticky='nsew')
-            
-            ttk.Label(form, text="名称:", font=('Microsoft YaHei UI', 9)).grid(
-                row=0, column=0, padx=10, pady=15, sticky=tk.W)
-            name_entry = ttk.Entry(form, width=45, font=('Microsoft YaHei UI', 9))
-            name_entry.grid(row=0, column=1, padx=10, pady=15, sticky='ew')
-            name_entry.focus()
-            
-            ttk.Label(form, text="API Key:", font=('Microsoft YaHei UI', 9)).grid(
-                row=1, column=0, padx=10, pady=15, sticky=tk.W)
-            key_entry = ttk.Entry(form, width=45, show='*', font=('Consolas', 9))
-            key_entry.grid(row=1, column=1, padx=10, pady=15, sticky='ew')
-            
-            form.columnconfigure(1, weight=1)
-            
-            def save_key():
-                name = name_entry.get().strip()
-                key = key_entry.get().strip()
-                
-                if not key:
-                    messagebox.showwarning("警告", "API Key 不能为空", parent=add_window)
-                    return
-                
-                if self.config_manager.add_api_key(key, name if name else None):
-                    messagebox.showinfo("成功", "API Key 已添加", parent=add_window)
-                    refresh_tree()
-                    self.load_settings()
-                    add_window.destroy()
-                else:
-                    messagebox.showwarning("警告", "该 API Key 已存在", parent=add_window)
-            
-            btn_frame_add = ttk.Frame(form)
-            btn_frame_add.grid(row=2, column=1, pady=20, sticky=tk.E)
-            
-            ttk.Button(btn_frame_add, text="保存", command=save_key, width=12).pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame_add, text="取消", command=add_window.destroy, width=12).pack(side=tk.LEFT)
+            for k in self.config_manager.get_api_keys():
+                if k['name'] == key_name:
+                    self.show_add_edit_key_dialog(manager_window, refresh_tree, k)
+                    break
         
         def remove_key():
             selection = tree.selection()
@@ -1424,24 +1935,278 @@ class TranslatorGUI:
             if messagebox.askyesno("确认", "确定要删除选中的 API Key 吗？", parent=manager_window):
                 for item in selection:
                     values = tree.item(item)['values']
-                    for k in self.config_manager.config.get('api_keys', []):
+                    for k in self.config_manager.get_api_keys():
                         if k['name'] == values[0]:
-                            self.config_manager.remove_api_key(k['key'])
+                            self.config_manager.remove_api_key(k['id'])
                             break
                 
                 refresh_tree()
                 self.load_settings()
         
+        def test_key():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("警告", "请选择要测试的 API Key", parent=manager_window)
+                return
+            
+            item = tree.item(selection[0])
+            key_name = item['values'][0]
+            
+            for k in self.config_manager.get_api_keys():
+                if k['name'] == key_name:
+                    self.test_api_key(k, manager_window, tree, selection[0])
+                    break
+        
         ttk.Button(btn_frame, text="➕ 添加", command=add_key, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="✏️ 编辑", command=edit_key, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="🧪 测试", command=test_key, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="🗑️ 删除", command=remove_key, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="关闭", command=manager_window.destroy, width=12).pack(side=tk.RIGHT, padx=5)
+    
+    def show_add_edit_key_dialog(self, parent, refresh_callback, key_data=None):
+        """显示添加/编辑API Key对话框"""
+        is_edit = key_data is not None
+        
+        dialog = tk.Toplevel(parent)
+        dialog.title("编辑 API Key" if is_edit else "添加 API Key")
+        dialog.geometry("550x600")
+        dialog.resizable(False, False)
+        dialog.transient(parent)
+        dialog.grab_set()
+        
+        dialog.rowconfigure(1, weight=1)
+        dialog.columnconfigure(0, weight=1)
+        
+        # 标题
+        ttk.Label(dialog, text="编辑 API Key" if is_edit else "添加 API Key", 
+                 style='Title.TLabel', padding="20 20 20 10").grid(row=0, column=0)
+        
+        # 表单
+        form = ttk.Frame(dialog, padding="20")
+        form.grid(row=1, column=0, sticky='nsew')
+        
+        # 名称
+        ttk.Label(form, text="名称:").grid(row=0, column=0, sticky=tk.W, pady=10)
+        name_var = tk.StringVar(value=key_data['name'] if is_edit else '')
+        name_entry = ttk.Entry(form, textvariable=name_var, width=40)
+        name_entry.grid(row=0, column=1, pady=10, sticky='ew')
+        
+        # 平台
+        ttk.Label(form, text="平台:").grid(row=1, column=0, sticky=tk.W, pady=10)
+        platform_var = tk.StringVar(value=key_data.get('platform', 'deepseek') if is_edit else 'deepseek')
+        platform_combo = ttk.Combobox(form, textvariable=platform_var, state='readonly', width=38)
+        platform_combo['values'] = [preset['display_name'] for preset in PLATFORM_PRESETS.values()]
+        
+        # 设置当前值
+        if is_edit:
+            current_platform = key_data.get('platform', 'deepseek')
+            display_name = PLATFORM_PRESETS.get(current_platform, {}).get('display_name', '')
+            if display_name:
+                platform_combo.set(display_name)
+        else:
+            platform_combo.current(0)
+        
+        platform_combo.grid(row=1, column=1, pady=10, sticky='ew')
+        
+        # 模型
+        ttk.Label(form, text="模型:").grid(row=2, column=0, sticky=tk.W, pady=10)
+        model_var = tk.StringVar(value=key_data.get('model', 'deepseek-chat') if is_edit else 'deepseek-chat')
+        model_combo = ttk.Combobox(form, textvariable=model_var, width=38)
+        model_combo.grid(row=2, column=1, pady=10, sticky='ew')
+        
+        def update_models(event=None):
+            """根据平台更新模型列表"""
+            selected_display_name = platform_combo.get()
+            
+            # 找到对应的平台ID
+            platform_id = None
+            for pid, preset in PLATFORM_PRESETS.items():
+                if preset['display_name'] == selected_display_name:
+                    platform_id = pid
+                    break
+            
+            if platform_id:
+                models = PLATFORM_PRESETS[platform_id]['models']
+                model_combo['values'] = models
+                if models:
+                    model_combo.set(models[0])
+                
+                # 自定义平台允许手动输入
+                if platform_id == 'custom':
+                    model_combo.config(state='normal')
+                    url_entry.config(state='normal')
+                else:
+                    model_combo.config(state='readonly')
+                    url_entry.config(state='disabled')
+                    url_var.set(PLATFORM_PRESETS[platform_id]['url'])
+        
+        platform_combo.bind('<<ComboboxSelected>>', update_models)
+        
+        # API Key
+        ttk.Label(form, text="API Key:").grid(row=3, column=0, sticky=tk.W, pady=10)
+        key_frame = ttk.Frame(form)
+        key_frame.grid(row=3, column=1, pady=10, sticky='ew')
+        
+        show_key = tk.BooleanVar(value=False)
+        key_var = tk.StringVar(value=key_data.get('api_key', '') if is_edit else '')
+        key_entry = ttk.Entry(key_frame, textvariable=key_var, show='*', width=32)
+        key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        def toggle_show():
+            if show_key.get():
+                key_entry.config(show='')
+            else:
+                key_entry.config(show='*')
+        
+        show_btn = ttk.Checkbutton(key_frame, text="👁️", variable=show_key, command=toggle_show, width=3)
+        show_btn.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # API URL
+        ttk.Label(form, text="API URL:").grid(row=4, column=0, sticky=tk.W, pady=10)
+        url_var = tk.StringVar(value=key_data.get('url', '') if is_edit else PLATFORM_PRESETS['deepseek']['url'])
+        url_entry = ttk.Entry(form, textvariable=url_var, width=40, state='disabled')
+        url_entry.grid(row=4, column=1, pady=10, sticky='ew')
+        
+        # 高级选项
+        advanced_frame = ttk.LabelFrame(form, text="高级选项", padding="10")
+        advanced_frame.grid(row=5, column=0, columnspan=2, sticky='ew', pady=10)
+        
+        ttk.Label(advanced_frame, text="Temperature:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        temp_var = tk.DoubleVar(value=key_data.get('temperature', 0.3) if is_edit else 0.3)
+        ttk.Entry(advanced_frame, textvariable=temp_var, width=10).grid(row=0, column=1, sticky=tk.W, pady=5)
+        ttk.Label(advanced_frame, text="(0.0-2.0)", foreground='gray').grid(row=0, column=2, sticky=tk.W, padx=(5,0))
+        
+        ttk.Label(advanced_frame, text="Max Tokens:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        tokens_var = tk.IntVar(value=key_data.get('max_tokens', 1000) if is_edit else 1000)
+        ttk.Entry(advanced_frame, textvariable=tokens_var, width=10).grid(row=1, column=1, sticky=tk.W, pady=5)
+        
+        form.columnconfigure(1, weight=1)
+        
+        # 初始化模型列表
+        update_models()
+        
+        # 按钮
+        btn_frame = ttk.Frame(dialog, padding="15")
+        btn_frame.grid(row=2, column=0, sticky='ew')
+        
+        def save():
+            name = name_var.get().strip()
+            api_key = key_var.get().strip()
+            
+            if not name:
+                messagebox.showwarning("警告", "请输入名称", parent=dialog)
+                return
+            
+            if not api_key:
+                messagebox.showwarning("警告", "请输入 API Key", parent=dialog)
+                return
+            
+            # 找到平台ID
+            selected_display_name = platform_combo.get()
+            platform_id = None
+            for pid, preset in PLATFORM_PRESETS.items():
+                if preset['display_name'] == selected_display_name:
+                    platform_id = pid
+                    break
+            
+            new_key_data = {
+                'name': name,
+                'platform': platform_id,
+                'api_key': api_key,
+                'model': model_var.get(),
+                'url': url_var.get(),
+                'temperature': temp_var.get(),
+                'max_tokens': tokens_var.get()
+            }
+            
+            if is_edit:
+                self.config_manager.update_api_key(key_data['id'], new_key_data)
+            else:
+                self.config_manager.add_api_key(new_key_data)
+            
+            messagebox.showinfo("成功", "API Key 已保存", parent=dialog)
+            refresh_callback()
+            self.load_settings()
+            dialog.destroy()
+        
+        ttk.Button(btn_frame, text="💾 保存", command=save, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="❌ 取消", command=dialog.destroy, width=12).pack(side=tk.LEFT, padx=5)
+    
+    def test_api_key(self, key_data, parent, tree, tree_item):
+        """测试API Key"""
+        test_window = tk.Toplevel(parent)
+        test_window.title("测试 API 连接")
+        test_window.geometry("400x250")
+        test_window.resizable(False, False)
+        test_window.transient(parent)
+        test_window.grab_set()
+        
+        test_window.rowconfigure(1, weight=1)
+        test_window.columnconfigure(0, weight=1)
+        
+        ttk.Label(test_window, text="测试 API 连接", 
+                 style='Title.TLabel', padding="20").grid(row=0, column=0)
+        
+        content = ttk.Frame(test_window, padding="20")
+        content.grid(row=1, column=0, sticky='nsew')
+        
+        platform_name = PLATFORM_PRESETS.get(key_data.get('platform', 'custom'), {}).get('name', '自定义')
+        ttk.Label(content, text=f"平台: {platform_name}").pack(pady=5)
+        ttk.Label(content, text=f"模型: {key_data.get('model', 'N/A')}").pack(pady=5)
+        
+        progress = ttk.Progressbar(content, mode='indeterminate')
+        progress.pack(fill=tk.X, pady=15)
+        
+        status_label = ttk.Label(content, text="正在测试...")
+        status_label.pack(pady=10)
+        
+        progress.start()
+        
+        def do_test():
+            try:
+                api_config = {
+                    'platform': key_data.get('platform', 'deepseek'),
+                    'api_key': key_data['api_key'],
+                    'model': key_data.get('model', 'deepseek-chat'),
+                    'url': key_data.get('url', ''),
+                    'temperature': key_data.get('temperature', 0.3),
+                    'max_tokens': key_data.get('max_tokens', 1000)
+                }
+                
+                translator = UniversalTranslator(api_config)
+                success, message = translator.test_connection()
+                
+                test_window.after(0, lambda: on_result(success, message))
+                
+            except Exception as e:
+                test_window.after(0, lambda: on_result(False, str(e)))
+        
+        def on_result(success, message):
+            progress.stop()
+            
+            if success:
+                status_label.config(text="✅ 测试成功！")
+                ttk.Label(content, text=message, foreground='green', wraplength=350).pack(pady=10)
+                
+                # 更新树视图
+                values = list(tree.item(tree_item)['values'])
+                values[3] = '✓ 成功'
+                tree.item(tree_item, values=values)
+            else:
+                status_label.config(text="❌ 测试失败")
+                ttk.Label(content, text=message, foreground='red', wraplength=350).pack(pady=10)
+            
+            ttk.Button(content, text="确定", command=test_window.destroy, width=12).pack(pady=10)
+        
+        thread = threading.Thread(target=do_test, daemon=True)
+        thread.start()
     
     def show_settings(self):
         """显示设置对话框"""
         settings_window = tk.Toplevel(self.root)
         settings_window.title("设置")
-        settings_window.geometry("600x550")
-        settings_window.minsize(550, 500)
+        settings_window.geometry("650x650")
+        settings_window.minsize(600, 600)
         settings_window.transient(self.root)
         settings_window.grab_set()
         
@@ -1457,64 +2222,133 @@ class TranslatorGUI:
         notebook = ttk.Notebook(settings_window)
         notebook.grid(row=1, column=0, sticky='nsew', padx=15, pady=(0, 10))
         
-        # ===== 基本设置选项卡 =====
-        basic_tab = ttk.Frame(notebook, padding="15")
-        notebook.add(basic_tab, text="基本设置")
+        # ===== 输出设置选项卡 =====
+        output_tab = ttk.Frame(notebook, padding="15")
+        notebook.add(output_tab, text="输出设置")
         
-        # 翻译设置
-        trans_frame = ttk.LabelFrame(basic_tab, text="翻译设置", padding="10")
-        trans_frame.pack(fill=tk.X, pady=(0, 10))
+        # 输出模式
+        mode_frame = ttk.LabelFrame(output_tab, text="输出模式", padding="10")
+        mode_frame.pack(fill=tk.X, pady=(0, 10))
         
-        auto_backup_var = tk.BooleanVar(value=self.config_manager.config.get('auto_backup', True))
-        ttk.Checkbutton(trans_frame, text="自动创建备份文件", variable=auto_backup_var).pack(anchor=tk.W, pady=2)
+        output_mode_var = tk.StringVar(value=self.config_manager.config.get('output_mode', 'export'))
+        
+        ttk.Radiobutton(mode_frame, text="导出到指定文件夹（推荐）", 
+                       variable=output_mode_var, value='export').pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(mode_frame, text="覆盖原文件（危险，但会创建备份）", 
+                       variable=output_mode_var, value='overwrite').pack(anchor=tk.W, pady=2)
+        
+        # 导出选项
+        export_frame = ttk.LabelFrame(output_tab, text="导出选项", padding="10")
+        export_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        folder_frame = ttk.Frame(export_frame)
+        folder_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(folder_frame, text="输出文件夹:").pack(side=tk.LEFT)
+        output_folder_var = tk.StringVar(value=self.config_manager.config.get('output_folder', ''))
+        ttk.Entry(folder_frame, textvariable=output_folder_var, width=35).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        def browse_folder():
+            folder = filedialog.askdirectory(title="选择输出文件夹")
+            if folder:
+                output_folder_var.set(folder)
+        
+        ttk.Button(folder_frame, text="浏览...", command=browse_folder, width=10).pack(side=tk.LEFT)
+        
+        keep_structure_var = tk.BooleanVar(value=self.config_manager.config.get('keep_structure', True))
+        ttk.Checkbutton(export_frame, text="保持原目录结构", variable=keep_structure_var).pack(anchor=tk.W, pady=2)
+        
+        # 语言标识
+        tag_frame = ttk.Frame(export_frame)
+        tag_frame.pack(fill=tk.X, pady=5)
+        
+        add_tag_var = tk.BooleanVar(value=self.config_manager.config.get('add_language_tag', True))
+        ttk.Checkbutton(tag_frame, text="添加语言标识:", variable=add_tag_var).pack(side=tk.LEFT)
+        
+        language_tag_var = tk.StringVar(value=self.config_manager.config.get('language_tag', '_zh_CN'))
+        
+        # 标识输入框和历史
+        tag_combo = ttk.Combobox(tag_frame, textvariable=language_tag_var, width=15)
+        tag_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 填充预设和历史
+        tag_values = []
+        for preset in self.config_manager.config.get('preset_tags', []):
+            tag_values.append(preset['tag'])
+        for history in self.config_manager.config.get('tag_history', []):
+            if history['tag'] not in tag_values:
+                tag_values.append(history['tag'])
+        tag_combo['values'] = tag_values
+        
+        # 位置选择
+        position_frame = ttk.Frame(export_frame)
+        position_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        tag_position_var = tk.StringVar(value=self.config_manager.config.get('tag_position', 'end'))
+        
+        ttk.Label(position_frame, text="位置:").pack(side=tk.LEFT)
+        ttk.Radiobutton(position_frame, text="文件名末尾 (file_zh_CN.yml)", 
+                       variable=tag_position_var, value='end').pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(position_frame, text="扩展名前 (file.zh_CN.yml)", 
+                       variable=tag_position_var, value='before_ext').pack(side=tk.LEFT)
+        
+        # 实时预览
+        preview_frame = ttk.Frame(export_frame)
+        preview_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        preview_label = ttk.Label(preview_frame, text="预览: ", foreground='gray')
+        preview_label.pack(side=tk.LEFT)
+        
+        preview_text = ttk.Label(preview_frame, text="config.yml → config_zh_CN.yml", foreground='blue')
+        preview_text.pack(side=tk.LEFT)
+        
+        def update_preview(*args):
+            tag = language_tag_var.get()
+            position = tag_position_var.get()
+            
+            if position == 'before_ext':
+                result = f"config.{tag.lstrip('_')}.yml"
+            else:
+                result = f"config{tag}.yml"
+            
+            preview_text.config(text=f"config.yml → {result}")
+        
+        language_tag_var.trace('w', update_preview)
+        tag_position_var.trace('w', update_preview)
+        
+        # 高级选项
+        advanced_frame = ttk.LabelFrame(output_tab, text="高级选项", padding="10")
+        advanced_frame.pack(fill=tk.X)
+        
+        generate_report_var = tk.BooleanVar(value=self.config_manager.config.get('generate_report', True))
+        ttk.Checkbutton(advanced_frame, text="生成对比报告 (HTML)", variable=generate_report_var).pack(anchor=tk.W, pady=2)
+        
+        # ===== 翻译设置选项卡 =====
+        trans_tab = ttk.Frame(notebook, padding="15")
+        notebook.add(trans_tab, text="翻译设置")
+        
+        basic_frame = ttk.LabelFrame(trans_tab, text="基本设置", padding="10")
+        basic_frame.pack(fill=tk.X, pady=(0, 10))
         
         skip_chinese_var = tk.BooleanVar(value=self.config_manager.config.get('skip_chinese', True))
-        ttk.Checkbutton(trans_frame, text="跳过已包含中文的字段", variable=skip_chinese_var).pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(basic_frame, text="跳过已包含中文的字段", variable=skip_chinese_var).pack(anchor=tk.W, pady=2)
         
-        auto_del_backup_var = tk.BooleanVar(value=self.config_manager.config.get('auto_delete_backup', False))
-        ttk.Checkbutton(trans_frame, text="翻译成功后自动删除备份", variable=auto_del_backup_var).pack(anchor=tk.W, pady=2)
-        
-        thread_frame = ttk.Frame(trans_frame)
-        thread_frame.pack(fill=tk.X, pady=(5, 2))
+        thread_frame = ttk.Frame(basic_frame)
+        thread_frame.pack(fill=tk.X, pady=5)
         ttk.Label(thread_frame, text="默认并发线程数:").pack(side=tk.LEFT, padx=(0, 8))
         thread_var = tk.IntVar(value=self.config_manager.config.get('max_threads', 4))
         ttk.Spinbox(thread_frame, from_=1, to=200, textvariable=thread_var, width=10).pack(side=tk.LEFT)
         ttk.Label(thread_frame, text="(1-200)", foreground='gray').pack(side=tk.LEFT, padx=(8, 0))
         
-        timeout_frame = ttk.Frame(trans_frame)
-        timeout_frame.pack(fill=tk.X, pady=2)
+        timeout_frame = ttk.Frame(basic_frame)
+        timeout_frame.pack(fill=tk.X, pady=5)
         ttk.Label(timeout_frame, text="API 请求超时:").pack(side=tk.LEFT, padx=(0, 8))
         timeout_var = tk.IntVar(value=self.config_manager.config.get('api_timeout', 30))
         ttk.Spinbox(timeout_frame, from_=5, to=300, textvariable=timeout_var, width=10).pack(side=tk.LEFT)
         ttk.Label(timeout_frame, text="秒", foreground='gray').pack(side=tk.LEFT, padx=(8, 0))
         
-        # 界面设置
-        ui_frame = ttk.LabelFrame(basic_tab, text="界面设置", padding="10")
-        ui_frame.pack(fill=tk.X)
-        
-        # ===== 高级设置选项卡 =====
-        advanced_tab = ttk.Frame(notebook, padding="15")
-        notebook.add(advanced_tab, text="高级设置")
-        
-        # 网络设置
-        net_frame = ttk.LabelFrame(advanced_tab, text="网络设置", padding="10")
-        net_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        proxy_var = tk.BooleanVar(value=self.config_manager.config.get('proxy_enabled', False))
-        ttk.Checkbutton(net_frame, text="使用代理", variable=proxy_var).pack(anchor=tk.W, pady=2)
-        
-        proxy_frame = ttk.Frame(net_frame)
-        proxy_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(proxy_frame, text="HTTP代理:").pack(side=tk.LEFT, padx=(20, 8))
-        proxy_host_var = tk.StringVar(value=self.config_manager.config.get('proxy_host', ''))
-        ttk.Entry(proxy_frame, textvariable=proxy_host_var, width=30).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(proxy_frame, text="端口:").pack(side=tk.LEFT, padx=(0, 8))
-        proxy_port_var = tk.IntVar(value=self.config_manager.config.get('proxy_port', 8080))
-        ttk.Entry(proxy_frame, textvariable=proxy_port_var, width=8).pack(side=tk.LEFT)
-        
         # 重试设置
-        retry_frame = ttk.LabelFrame(advanced_tab, text="失败重试", padding="10")
-        retry_frame.pack(fill=tk.X, pady=(0, 10))
+        retry_frame = ttk.LabelFrame(trans_tab, text="失败重试", padding="10")
+        retry_frame.pack(fill=tk.X)
         
         retry_var = tk.BooleanVar(value=self.config_manager.config.get('enable_retry', True))
         ttk.Checkbutton(retry_frame, text="失败自动重试", variable=retry_var).pack(anchor=tk.W, pady=2)
@@ -1532,48 +2366,6 @@ class TranslatorGUI:
         ttk.Spinbox(retry_delay_frame, from_=1, to=60, textvariable=retry_delay_var, width=8).pack(side=tk.LEFT)
         ttk.Label(retry_delay_frame, text="秒").pack(side=tk.LEFT, padx=(8, 0))
         
-        # 日志设置
-        log_frame = ttk.LabelFrame(advanced_tab, text="日志设置", padding="10")
-        log_frame.pack(fill=tk.X)
-        
-        auto_save_log_var = tk.BooleanVar(value=self.config_manager.config.get('auto_save_log', False))
-        ttk.Checkbutton(log_frame, text="自动保存日志", variable=auto_save_log_var).pack(anchor=tk.W, pady=2)
-        
-        save_history_var = tk.BooleanVar(value=self.config_manager.config.get('save_history', True))
-        ttk.Checkbutton(log_frame, text="保存翻译历史记录", variable=save_history_var).pack(anchor=tk.W, pady=2)
-        
-        history_count_frame = ttk.Frame(log_frame)
-        history_count_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(history_count_frame, text="最多保留:").pack(side=tk.LEFT, padx=(20, 8))
-        history_count_var = tk.IntVar(value=self.config_manager.config.get('max_history', 100))
-        ttk.Entry(history_count_frame, textvariable=history_count_var, width=8).pack(side=tk.LEFT)
-        ttk.Label(history_count_frame, text="条").pack(side=tk.LEFT, padx=(8, 0))
-        
-        # ===== 快捷键选项卡 =====
-        shortcuts_tab = ttk.Frame(notebook, padding="15")
-        notebook.add(shortcuts_tab, text="快捷键")
-        
-        shortcuts_info = ttk.Label(shortcuts_tab, 
-            text="快捷键配置（当前版本使用默认快捷键）",
-            foreground='gray')
-        shortcuts_info.pack(pady=10)
-        
-        shortcuts_list = [
-            ("添加文件", "Ctrl+O"),
-            ("添加文件夹", "Ctrl+D"),
-            ("开始翻译", "F5"),
-            ("停止翻译", "Esc"),
-            ("清空日志", "Ctrl+L"),
-            ("移除选中", "Delete"),
-            ("设置", "Ctrl+,")
-        ]
-        
-        for name, key in shortcuts_list:
-            frame = ttk.Frame(shortcuts_tab)
-            frame.pack(fill=tk.X, pady=3)
-            ttk.Label(frame, text=name + ":", width=15).pack(side=tk.LEFT, padx=(0, 10))
-            ttk.Label(frame, text=key, foreground='blue').pack(side=tk.LEFT)
-        
         # ===== 关于选项卡 =====
         about_tab = ttk.Frame(notebook, padding="15")
         notebook.add(about_tab, text="关于")
@@ -1581,16 +2373,17 @@ class TranslatorGUI:
         about_text = f"""
 {APP_TITLE}
 
-一个YAML文件批量AI翻译工具
+一个专业的 YAML 文件批量翻译工具
 
-特性:
-• 支持多线程并发翻译
+主要特性:
+• 支持多平台 API (DeepSeek, OpenAI, Moonshot等)
+• 多线程并发翻译
 • 智能上下文翻译
-• 自动备份和恢复
+• 文件导出功能（不覆盖源文件）
+• 自动生成对比报告
 • 翻译历史记录
 • 丰富的配置选项
 
-作者: Mr.Centes，Claude
 版本: {VERSION}
         """
         
@@ -1602,20 +2395,20 @@ class TranslatorGUI:
         
         def save_settings():
             # 保存所有设置
-            self.config_manager.config['auto_backup'] = auto_backup_var.get()
+            self.config_manager.config['output_mode'] = output_mode_var.get()
+            self.config_manager.config['output_folder'] = output_folder_var.get()
+            self.config_manager.config['keep_structure'] = keep_structure_var.get()
+            self.config_manager.config['add_language_tag'] = add_tag_var.get()
+            self.config_manager.config['language_tag'] = language_tag_var.get()
+            self.config_manager.config['tag_position'] = tag_position_var.get()
+            self.config_manager.config['generate_report'] = generate_report_var.get()
+            
             self.config_manager.config['skip_chinese'] = skip_chinese_var.get()
-            self.config_manager.config['auto_delete_backup'] = auto_del_backup_var.get()
             self.config_manager.config['max_threads'] = thread_var.get()
             self.config_manager.config['api_timeout'] = timeout_var.get()
-            self.config_manager.config['proxy_enabled'] = proxy_var.get()
-            self.config_manager.config['proxy_host'] = proxy_host_var.get()
-            self.config_manager.config['proxy_port'] = proxy_port_var.get()
             self.config_manager.config['enable_retry'] = retry_var.get()
             self.config_manager.config['max_retries'] = retry_count_var.get()
             self.config_manager.config['retry_delay'] = retry_delay_var.get()
-            self.config_manager.config['auto_save_log'] = auto_save_log_var.get()
-            self.config_manager.config['save_history'] = save_history_var.get()
-            self.config_manager.config['max_history'] = history_count_var.get()
             
             self.config_manager.save_config()
             
@@ -1625,31 +2418,228 @@ class TranslatorGUI:
             messagebox.showinfo("成功", "设置已保存", parent=settings_window)
             settings_window.destroy()
         
-        def reset_defaults():
-            if messagebox.askyesno("确认", "确定要恢复默认设置吗？", parent=settings_window):
-                auto_backup_var.set(True)
-                skip_chinese_var.set(True)
-                auto_del_backup_var.set(False)
-                thread_var.set(4)
-                timeout_var.set(30)
-                proxy_var.set(False)
-                retry_var.set(True)
-                retry_count_var.set(3)
-                retry_delay_var.set(5)
-                auto_save_log_var.set(False)
-                save_history_var.set(True)
-                history_count_var.set(100)
-        
         ttk.Button(btn_frame, text="保存", command=save_settings, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=settings_window.destroy, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="恢复默认", command=reset_defaults, width=12).pack(side=tk.RIGHT, padx=5)
     
+    def show_output_quick_settings(self):
+        """显示输出快速设置对话框"""
+        quick_window = tk.Toplevel(self.root)
+        quick_window.title("输出设置")
+        quick_window.geometry("550x500")
+        quick_window.minsize(500, 400)  # ← 修改：设置最小尺寸，允许调整大小
+        quick_window.transient(self.root)
+        quick_window.grab_set()
+        
+        quick_window.rowconfigure(1, weight=1)
+        quick_window.columnconfigure(0, weight=1)
+        
+        # 标题
+        title_frame = ttk.Frame(quick_window, padding="15 15 15 10")
+        title_frame.grid(row=0, column=0, sticky='ew')
+        ttk.Label(title_frame, text="📂 输出设置", style='Title.TLabel').pack(anchor=tk.W)
+        
+        # ===== 新增：创建可滚动的主内容区域 =====
+        # 创建Canvas和滚动条容器
+        scroll_container = ttk.Frame(quick_window)
+        scroll_container.grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
+        scroll_container.rowconfigure(0, weight=1)
+        scroll_container.columnconfigure(0, weight=1)
+        
+        # 创建Canvas
+        canvas = tk.Canvas(scroll_container, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        
+        # 创建滚动条
+        scrollbar = ttk.Scrollbar(scroll_container, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 在Canvas中创建内容框架
+        content = ttk.Frame(canvas, padding="15")
+        canvas_window = canvas.create_window((0, 0), window=content, anchor='nw')
+        
+        # 绑定Canvas大小变化事件
+        def on_canvas_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # 让内容框架宽度跟随Canvas宽度
+            canvas.itemconfig(canvas_window, width=event.width)
+        
+        canvas.bind('<Configure>', on_canvas_configure)
+        
+        # 绑定鼠标滚轮事件
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        canvas.bind_all("<MouseWheel>", on_mousewheel)
+        
+        # 当内容框架大小变化时更新滚动区域
+        def on_content_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        content.bind('<Configure>', on_content_configure)
+        # ===== 滚动区域设置结束 =====
+        
+        # 输出模式
+        mode_frame = ttk.LabelFrame(content, text="输出模式", padding="10")
+        mode_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        output_mode_var = tk.StringVar(value=self.config_manager.config.get('output_mode', 'export'))
+        
+        ttk.Radiobutton(mode_frame, text="📁 导出到指定文件夹（推荐，不修改源文件）", 
+                       variable=output_mode_var, value='export').pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(mode_frame, text="⚠️  覆盖原文件（危险，但会创建备份）", 
+                       variable=output_mode_var, value='overwrite').pack(anchor=tk.W, pady=3)
+        
+        # 输出文件夹选择
+        folder_frame = ttk.LabelFrame(content, text="输出位置", padding="10")
+        folder_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        path_frame = ttk.Frame(folder_frame)
+        path_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(path_frame, text="输出文件夹:").pack(side=tk.LEFT)
+        output_folder_var = tk.StringVar(value=self.config_manager.config.get('output_folder', ''))
+        
+        path_entry = ttk.Entry(path_frame, textvariable=output_folder_var, width=30)
+        path_entry.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        
+        def browse_folder():
+            folder = filedialog.askdirectory(
+                title="选择输出文件夹",
+                parent=quick_window
+            )
+            if folder:
+                output_folder_var.set(folder)
+        
+        ttk.Button(path_frame, text="浏览...", command=browse_folder, width=10).pack(side=tk.LEFT)
+        
+        # 提示信息
+        hint_label = ttk.Label(folder_frame, 
+                              text="💡 留空则使用源文件夹下的 'translated' 子文件夹",
+                              font=('Microsoft YaHei UI', 8),
+                              foreground='gray')
+        hint_label.pack(anchor=tk.W, pady=(5, 0))
+        
+        keep_structure_var = tk.BooleanVar(value=self.config_manager.config.get('keep_structure', True))
+        ttk.Checkbutton(folder_frame, text="保持原目录结构", 
+                       variable=keep_structure_var).pack(anchor=tk.W, pady=(10, 0))
+        
+        # 语言标识设置
+        tag_frame = ttk.LabelFrame(content, text="语言标识", padding="10")
+        tag_frame.pack(fill=tk.X)
+        
+        add_tag_var = tk.BooleanVar(value=self.config_manager.config.get('add_language_tag', True))
+        ttk.Checkbutton(tag_frame, text="添加语言标识到文件名", 
+                       variable=add_tag_var).pack(anchor=tk.W, pady=5)
+        
+        # 标识输入
+        tag_input_frame = ttk.Frame(tag_frame)
+        tag_input_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        ttk.Label(tag_input_frame, text="标识:").pack(side=tk.LEFT)
+        
+        language_tag_var = tk.StringVar(value=self.config_manager.config.get('language_tag', '_zh_CN'))
+        
+        tag_combo = ttk.Combobox(tag_input_frame, textvariable=language_tag_var, width=15)
+        tag_combo.pack(side=tk.LEFT, padx=8)
+        
+        # 填充预设和历史
+        tag_values = []
+        for preset in self.config_manager.config.get('preset_tags', []):
+            tag_values.append(preset['tag'])
+        for history in self.config_manager.config.get('tag_history', []):
+            if history['tag'] not in tag_values:
+                tag_values.append(history['tag'])
+        tag_combo['values'] = tag_values
+        
+        # 位置选择
+        position_frame = ttk.Frame(tag_frame)
+        position_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        tag_position_var = tk.StringVar(value=self.config_manager.config.get('tag_position', 'end'))
+        
+        ttk.Label(position_frame, text="位置:").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(position_frame, text="末尾", 
+                       variable=tag_position_var, value='end').pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(position_frame, text="扩展名前", 
+                       variable=tag_position_var, value='before_ext').pack(side=tk.LEFT)
+        
+        # 预览
+        preview_frame = ttk.Frame(tag_frame)
+        preview_frame.pack(fill=tk.X, pady=(10, 5), padx=(20, 0))
+        
+        preview_label = ttk.Label(preview_frame, text="", foreground='blue', font=('Consolas', 9))
+        preview_label.pack(side=tk.LEFT)
+        
+        def update_preview(*args):
+            if not add_tag_var.get():
+                preview_label.config(text="预览: config.yml → config.yml")
+                return
+            
+            tag = language_tag_var.get()
+            position = tag_position_var.get()
+            
+            if position == 'before_ext':
+                result = f"config.{tag.lstrip('_')}.yml"
+            else:
+                result = f"config{tag}.yml"
+            
+            preview_label.config(text=f"预览: config.yml → {result}")
+        
+        language_tag_var.trace('w', update_preview)
+        tag_position_var.trace('w', update_preview)
+        add_tag_var.trace('w', update_preview)
+        
+        update_preview()  # 初始化预览
+        
+        # 底部按钮（在滚动区域外）
+        btn_frame = ttk.Frame(quick_window, padding="15")
+        btn_frame.grid(row=2, column=0, sticky='ew')
+        
+        def save_and_close():
+            # 保存设置
+            self.config_manager.config['output_mode'] = output_mode_var.get()
+            self.config_manager.config['output_folder'] = output_folder_var.get()
+            self.config_manager.config['keep_structure'] = keep_structure_var.get()
+            self.config_manager.config['add_language_tag'] = add_tag_var.get()
+            self.config_manager.config['language_tag'] = language_tag_var.get()
+            self.config_manager.config['tag_position'] = tag_position_var.get()
+            
+            self.config_manager.save_config()
+            
+            # 保存语言标识到历史
+            if add_tag_var.get() and language_tag_var.get():
+                self.config_manager.add_tag_to_history(language_tag_var.get())
+            
+            messagebox.showinfo("成功", "输出设置已保存", parent=quick_window)
+            quick_window.destroy()
+        
+        def open_full_settings():
+            """打开完整设置窗口"""
+            quick_window.destroy()
+            self.show_settings()
+        
+        def on_close():
+            """关闭窗口时解绑鼠标滚轮事件"""
+            canvas.unbind_all("<MouseWheel>")
+            quick_window.destroy()
+        
+        quick_window.protocol("WM_DELETE_WINDOW", on_close)
+        
+        ttk.Button(btn_frame, text="💾 保存", command=save_and_close, 
+                  width=12, style='Accent.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="⚙️ 更多设置...", command=open_full_settings, 
+                  width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=on_close, 
+                  width=12).pack(side=tk.RIGHT, padx=5)
+
     def show_history(self):
-        """显示翻译历史记录"""
+        """显示翻译历史"""
         history_window = tk.Toplevel(self.root)
         history_window.title("翻译历史记录")
-        history_window.geometry("800x500")
-        history_window.minsize(700, 400)
+        history_window.geometry("900x550")
+        history_window.minsize(800, 500)
         history_window.transient(self.root)
         history_window.grab_set()
         
@@ -1674,17 +2664,19 @@ class TranslatorGUI:
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
         
-        columns = ('time', 'files', 'success', 'failed', 'duration')
+        columns = ('time', 'files', 'success', 'skipped', 'failed', 'duration')
         tree = ttk.Treeview(list_frame, columns=columns, show='headings')
         tree.heading('time', text='时间')
         tree.heading('files', text='文件数')
         tree.heading('success', text='成功')
+        tree.heading('skipped', text='跳过')
         tree.heading('failed', text='失败')
         tree.heading('duration', text='耗时')
         
         tree.column('time', width=180)
         tree.column('files', width=80)
         tree.column('success', width=80)
+        tree.column('skipped', width=80)
         tree.column('failed', width=80)
         tree.column('duration', width=100)
         
@@ -1694,7 +2686,7 @@ class TranslatorGUI:
         tree.grid(row=0, column=0, sticky='nsew')
         scrollbar.grid(row=0, column=1, sticky='ns')
         
-        # 加载历史记录
+        # 加载历史
         for item in self.config_manager.config.get('history', []):
             time_str = item['timestamp'][:19].replace('T', ' ')
             duration_str = f"{item.get('duration', 0):.1f}秒"
@@ -1703,6 +2695,7 @@ class TranslatorGUI:
                 time_str,
                 item['processed_files'],
                 item['successful_translations'],
+                item.get('skipped_translations', 0),
                 item['failed_translations'],
                 duration_str
             ))
@@ -1725,7 +2718,7 @@ class TranslatorGUI:
         """显示使用说明"""
         help_window = tk.Toplevel(self.root)
         help_window.title("使用说明")
-        help_window.geometry("700x600")
+        help_window.geometry("750x650")
         help_window.transient(self.root)
         
         help_window.rowconfigure(0, weight=1)
@@ -1740,36 +2733,70 @@ class TranslatorGUI:
 {APP_TITLE} - 使用说明
 
 一、快速开始
-1. 配置 API Key：点击"工具" → "管理 API Key"，添加你的 DeepSeek API Key
-2. 添加文件：通过按钮或拖拽添加需要翻译的 YAML 文件
-3. 调整线程数：根据需要调整并发线程数（建议 1-50）
-4. 开始翻译：点击"开始翻译"按钮
+1. 配置 API Key
+   • 点击"工具" → "管理 API Key"
+   • 选择平台（DeepSeek、OpenAI、Moonshot等）
+   • 输入 API Key 并保存
+   • 测试连接确保可用
 
-二、主要功能
-
-1. 文件管理
-   • 支持添加单个文件或整个文件夹
+2. 添加文件
+   • 通过按钮添加单个文件或文件夹
    • 支持拖拽文件/文件夹（需安装 tkinterdnd2）
-   • 右键菜单：打开位置、复制路径等
-   • 多种显示模式和排序方式
 
-2. 翻译设置
-   • 自动创建备份：翻译前自动备份原文件（.backup）
-   • 跳过中文字段：已包含中文的字段不翻译
-   • 并发控制：调整线程数提高翻译效率
-   • 失败重试：网络错误时自动重试
+3. 配置输出
+   • 点击"工具" → "设置" → "输出设置"
+   • 选择输出模式（导出或覆盖）
+   • 设置输出文件夹
+   • 配置语言标识
 
-3. 备份管理
-   • 恢复所有备份：一键恢复所有 .backup 文件
-   • 清理所有备份：批量删除备份文件
-   • 查看备份文件：列出所有备份
+4. 开始翻译
+   • 点击"开始翻译"按钮
+   • 等待完成并查看对比报告
 
-4. 翻译历史
-   • 自动记录每次翻译任务
-   • 查看详细统计信息
-   • 支持导出报告
+二、输出模式说明
 
-三、快捷键
+1. 导出模式（推荐）
+   • 不修改源文件
+   • 翻译结果保存到指定文件夹
+   • 可选保持原目录结构
+   • 可添加语言标识
+
+2. 覆盖模式
+   • 直接替换源文件内容
+   • 自动创建 .backup 备份
+   • 适合直接更新项目文件
+
+三、语言标识功能
+
+• 自动记住最近使用的标识
+• 预设常用标识（_zh_CN、_zh_TW等）
+• 支持自定义标识
+• 两种位置：文件名末尾 或 扩展名前
+
+示例：
+  文件名末尾: config.yml → config_zh_CN.yml
+  扩展名前: config.yml → config.zh_CN.yml
+
+四、多平台 API 支持
+
+支持平台：
+• 🤖 DeepSeek - 推荐，性价比高
+• 🧠 OpenAI - GPT系列，效果好
+• 🌙 Moonshot - Kimi，上下文长
+• 🧩 智谱AI - GLM系列
+• ☁️ 通义千问 - 阿里云
+• ⚙️ 自定义 - 支持任何OpenAI兼容API
+
+五、对比报告
+
+翻译完成后自动生成 HTML 报告：
+• 详细的翻译对比
+• 文件级别的统计
+• 成功/跳过/失败分类
+• 美观的网页界面
+
+六、快捷键
+
 • Ctrl+O     - 添加文件
 • Ctrl+D     - 添加文件夹
 • F5         - 开始翻译
@@ -1778,39 +2805,27 @@ class TranslatorGUI:
 • Delete     - 移除选中文件
 • Ctrl+,     - 打开设置
 
-四、高级功能
+七、注意事项
 
-1. 代理设置
-   在"设置" → "高级设置"中配置 HTTP 代理
+• 建议线程数设置为 1-50
+• 首次使用建议使用导出模式
+• 大批量翻译建议分批进行
+• 注意 API 调用限流
+• 定期查看翻译历史记录
 
-2. 自动重试
-   网络错误时自动重试，可配置重试次数和延迟
-
-3. 日志管理
-   支持自动保存日志到文件
-
-4. 主题切换
-   支持亮色和暗色两种主题
-
-五、注意事项
-• 首次使用需要配置 DeepSeek API Key
-• 翻译前会自动创建备份文件
-• 大文件建议适当降低线程数
-• 翻译过程中不要关闭程序
-
-六、常见问题
+八、常见问题
 
 Q: 无法拖拽文件怎么办？
-A: 需要安装 tkinterdnd2，点击底部提示链接一键安装
+A: 点击底部提示链接一键安装 tkinterdnd2
 
 Q: 翻译失败怎么办？
-A: 检查 API Key 是否正确，网络是否正常，可开启自动重试
+A: 检查 API Key、网络连接，开启自动重试
 
-Q: 如何恢复翻译前的文件？
-A: 使用"备份" → "恢复所有备份"功能
+Q: 如何恢复源文件？
+A: 导出模式源文件未修改；覆盖模式可用 .backup 文件
 
-Q: 历史记录太多怎么办？
-A: 在设置中调整"最多保留"数量，或清除历史记录
+Q: 支持哪些翻译方向？
+A: 目前主要支持英文→中文
         """
         
         help_text.insert('1.0', content)
@@ -1821,161 +2836,25 @@ A: 在设置中调整"最多保留"数量，或清除历史记录
         ttk.Button(btn_frame, text="关闭", command=help_window.destroy, width=12).pack(side=tk.RIGHT)
     
     def show_about(self):
-        """显示关于对话框"""
+        """显示关于"""
         about_text = f"""
 {APP_TITLE}
 
-一个专业的 YAML 文件批量翻译工具
+一个YAML文件批量AI翻译工具
 
-特性:
-• 支持多线程并发翻译
+主要特性:
+• 支持多平台 API (DeepSeek, OpenAI, Moonshot等)
+• 文件导出功能，不覆盖源文件
+• 自动生成精美的对比报告
+• 多线程并发翻译
 • 智能上下文翻译
-• 自动备份和恢复
 • 翻译历史记录
 • 丰富的配置选项
-• 快捷键支持
-• 主题切换
 
-技术栈:
-• Python 3
-• Tkinter GUI
-• DeepSeek AI API
-
+作者: Mr.Centes，Claude
 版本: {VERSION}
         """
         messagebox.showinfo("关于", about_text)
-    
-    # ==================== 备份管理 ====================
-    
-    def restore_all_backups(self):
-        """恢复所有备份"""
-        if not messagebox.askyesno("确认", "确定要恢复所有备份文件吗？\n这将覆盖当前的文件。"):
-            return
-        
-        folder = filedialog.askdirectory(title="选择要恢复备份的文件夹")
-        if not folder:
-            return
-        
-        restored = 0
-        for root, dirs, files in os.walk(folder):
-            for file in files:
-                if file.endswith('.backup'):
-                    backup_path = os.path.join(root, file)
-                    original_path = backup_path[:-7]  # 移除 .backup
-                    
-                    try:
-                        shutil.copy2(backup_path, original_path)
-                        restored += 1
-                    except Exception as e:
-                        self.log_message(f"[ERROR] 恢复失败: {file} - {e}")
-        
-        if restored > 0:
-            messagebox.showinfo("完成", f"成功恢复 {restored} 个文件")
-            self.log_message(f"[SUCCESS] 恢复了 {restored} 个备份文件")
-        else:
-            messagebox.showinfo("提示", "未找到备份文件")
-    
-    def cleanup_all_backups(self):
-        """清理所有备份"""
-        if not messagebox.askyesno("确认", "确定要删除所有备份文件吗？\n此操作不可恢复！"):
-            return
-        
-        folder = filedialog.askdirectory(title="选择要清理备份的文件夹")
-        if not folder:
-            return
-        
-        deleted = 0
-        for root, dirs, files in os.walk(folder):
-            for file in files:
-                if file.endswith('.backup'):
-                    backup_path = os.path.join(root, file)
-                    try:
-                        os.remove(backup_path)
-                        deleted += 1
-                    except Exception as e:
-                        self.log_message(f"[ERROR] 删除失败: {file} - {e}")
-        
-        if deleted > 0:
-            messagebox.showinfo("完成", f"成功删除 {deleted} 个备份文件")
-            self.log_message(f"[SUCCESS] 删除了 {deleted} 个备份文件")
-        else:
-            messagebox.showinfo("提示", "未找到备份文件")
-    
-    def view_backups(self):
-        """查看备份文件"""
-        folder = filedialog.askdirectory(title="选择要查看备份的文件夹")
-        if not folder:
-            return
-        
-        backups = []
-        for root, dirs, files in os.walk(folder):
-            for file in files:
-                if file.endswith('.backup'):
-                    backup_path = os.path.join(root, file)
-                    backups.append(backup_path)
-        
-        if not backups:
-            messagebox.showinfo("提示", "未找到备份文件")
-            return
-        
-        # 显示备份列表窗口
-        backup_window = tk.Toplevel(self.root)
-        backup_window.title("备份文件列表")
-        backup_window.geometry("700x500")
-        backup_window.transient(self.root)
-        
-        backup_window.rowconfigure(1, weight=1)
-        backup_window.columnconfigure(0, weight=1)
-        
-        # 标题
-        title_frame = ttk.Frame(backup_window, padding="15 15 15 10")
-        title_frame.grid(row=0, column=0, sticky='ew')
-        ttk.Label(title_frame, text=f"找到 {len(backups)} 个备份文件", 
-                 style='Title.TLabel').pack(anchor=tk.W)
-        
-        # 列表
-        list_frame = ttk.Frame(backup_window, padding="0 0 15 10")
-        list_frame.grid(row=1, column=0, sticky='nsew', padx=15)
-        list_frame.rowconfigure(0, weight=1)
-        list_frame.columnconfigure(0, weight=1)
-        
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.grid(row=0, column=1, sticky='ns')
-        
-        backup_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set)
-        backup_listbox.grid(row=0, column=0, sticky='nsew')
-        scrollbar.config(command=backup_listbox.yview)
-        
-        for backup in backups:
-            backup_listbox.insert(tk.END, os.path.relpath(backup, folder))
-        
-        # 按钮
-        btn_frame = ttk.Frame(backup_window, padding="15")
-        btn_frame.grid(row=2, column=0, sticky='ew')
-        
-        def restore_selected():
-            selection = backup_listbox.curselection()
-            if not selection:
-                messagebox.showwarning("警告", "请选择要恢复的备份", parent=backup_window)
-                return
-            
-            restored = 0
-            for idx in selection:
-                backup_path = backups[idx]
-                original_path = backup_path[:-7]
-                
-                try:
-                    shutil.copy2(backup_path, original_path)
-                    restored += 1
-                except Exception as e:
-                    self.log_message(f"[ERROR] 恢复失败: {os.path.basename(backup_path)} - {e}")
-            
-            messagebox.showinfo("完成", f"成功恢复 {restored} 个文件", parent=backup_window)
-        
-        ttk.Button(btn_frame, text="恢复选中", command=restore_selected, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="关闭", command=backup_window.destroy, width=12).pack(side=tk.RIGHT, padx=5)
-    
-    # ==================== 其他功能 ====================
     
     def install_dnd(self):
         """安装 tkinterdnd2"""
@@ -1989,11 +2868,9 @@ A: 在设置中调整"最多保留"数量，或清除历史记录
         install_window.rowconfigure(1, weight=1)
         install_window.columnconfigure(0, weight=1)
         
-        # 标题
         ttk.Label(install_window, text="安装 tkinterdnd2", 
                  style='Title.TLabel', padding="20 20 20 10").grid(row=0, column=0)
         
-        # 进度
         progress_frame = ttk.Frame(install_window, padding="20")
         progress_frame.grid(row=1, column=0, sticky='nsew')
         
@@ -2015,10 +2892,8 @@ A: 在设置中调整"最多保留"数量，或清除历史记录
                 )
                 
                 if result.returncode == 0:
-                    # 安装成功
                     install_window.after(0, lambda: on_success())
                 else:
-                    # 安装失败
                     install_window.after(0, lambda: on_failure(result.stderr))
                     
             except Exception as e:
@@ -2040,116 +2915,14 @@ A: 在设置中调整"最多保留"数量，或清除历史记录
             progress_bar.stop()
             install_window.destroy()
             
-            # 显示失败对话框
-            fail_window = tk.Toplevel(self.root)
-            fail_window.title("安装失败")
-            fail_window.geometry("450x250")
-            fail_window.transient(self.root)
-            fail_window.grab_set()
-            
-            fail_window.rowconfigure(1, weight=1)
-            fail_window.columnconfigure(0, weight=1)
-            
-            ttk.Label(fail_window, text="⚠️ 安装失败", 
-                     style='Title.TLabel', padding="20").grid(row=0, column=0)
-            
-            msg_frame = ttk.Frame(fail_window, padding="20")
-            msg_frame.grid(row=1, column=0, sticky='nsew')
-            
-            ttk.Label(msg_frame, text="无法自动安装 tkinterdnd2").pack(pady=(0, 10))
-            ttk.Label(msg_frame, text="✅ 翻译功能仍可正常使用", 
-                     foreground='green').pack(pady=(0, 10))
-            ttk.Label(msg_frame, text="（可通过按钮添加文件）", 
-                     foreground='gray').pack(pady=(0, 20))
-            
-            btn_frame = ttk.Frame(msg_frame)
-            btn_frame.pack()
-            
-            ttk.Button(btn_frame, text="查看手动安装指南", 
-                      command=lambda: self.show_manual_install(fail_window), 
-                      width=18).pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame, text="知道了", 
-                      command=fail_window.destroy, 
-                      width=12).pack(side=tk.LEFT, padx=5)
+            messagebox.showerror("安装失败", 
+                f"无法自动安装 tkinterdnd2\n\n"
+                f"✅ 翻译功能仍可正常使用\n"
+                f"（可通过按钮添加文件）\n\n"
+                f"错误信息: {error[:100]}")
         
-        # 在新线程中执行安装
         thread = threading.Thread(target=do_install, daemon=True)
         thread.start()
-    
-    def show_manual_install(self, parent=None):
-        """显示手动安装指南"""
-        guide_window = tk.Toplevel(parent or self.root)
-        guide_window.title("手动安装指南")
-        guide_window.geometry("500x350")
-        guide_window.transient(parent or self.root)
-        
-        guide_window.rowconfigure(1, weight=1)
-        guide_window.columnconfigure(0, weight=1)
-        
-        ttk.Label(guide_window, text="手动安装 tkinterdnd2", 
-                 style='Title.TLabel', padding="20").grid(row=0, column=0)
-        
-        text_frame = ttk.Frame(guide_window, padding="20")
-        text_frame.grid(row=1, column=0, sticky='nsew')
-        text_frame.rowconfigure(0, weight=1)
-        text_frame.columnconfigure(0, weight=1)
-        
-        guide_text = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, 
-                                               font=('Microsoft YaHei UI', 9))
-        guide_text.grid(row=0, column=0, sticky='nsew')
-        
-        content = """方法1: 使用 pip (推荐)
-
-1. 打开命令提示符 (Windows) 或终端 (Mac/Linux)
-2. 输入以下命令:
-
-   pip install tkinterdnd2
-
-3. 等待安装完成
-4. 重启本程序
-
-
-方法2: 如果 pip 失败
-
-1. 以管理员身份运行命令提示符
-2. 重新执行上述命令
-
-
-方法3: 使用 Python 模块
-
-1. 打开命令提示符
-2. 输入:
-
-   python -m pip install tkinterdnd2
-
-
-常见问题:
-
-Q: 提示"pip不是内部或外部命令"
-A: 需要先安装 Python 并将其添加到系统路径
-
-Q: 安装后仍无法使用
-A: 确保重启了程序
-
-Q: 权限错误
-A: 以管理员身份运行命令提示符
-
-如有其他问题，请查看 tkinterdnd2 官方文档
-        """
-        
-        guide_text.insert('1.0', content)
-        guide_text.config(state='disabled')
-        
-        btn_frame = ttk.Frame(guide_window, padding="15")
-        btn_frame.grid(row=2, column=0, sticky='ew')
-        
-        def copy_command():
-            self.root.clipboard_clear()
-            self.root.clipboard_append("pip install tkinterdnd2")
-            messagebox.showinfo("成功", "命令已复制到剪贴板", parent=guide_window)
-        
-        ttk.Button(btn_frame, text="复制安装命令", command=copy_command, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="关闭", command=guide_window.destroy, width=12).pack(side=tk.RIGHT, padx=5)
     
     def change_theme(self):
         """切换主题"""
@@ -2170,7 +2943,6 @@ A: 以管理员身份运行命令提示符
 
 # ==================== 主程序入口 ====================
 def main():
-    # 创建主窗口
     if HAS_DND:
         root = TkinterDnD.Tk()
     else:
