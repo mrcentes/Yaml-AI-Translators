@@ -1,4 +1,4 @@
-# YAML批量AI本地化工具 v1.30 (重构优化版)
+# YAML批量AI本地化工具 v1.31 (增强版)
 
 import os
 import sys
@@ -9,12 +9,13 @@ import shutil
 import requests
 import subprocess
 import webbrowser
+import platform
 from collections import deque
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List, Tuple, Any, Set
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple, Any, Callable
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, Menu
 import yaml
@@ -22,44 +23,34 @@ import yaml
 # ==================== 修复 Windows DPI 模糊问题 ====================
 try:
     from ctypes import windll
-    windll.shcore.SetProcessDpiAwareness(1)
-except:
+    try:
+        windll.user32.SetProcessDPIAware()
+    except AttributeError:
+        windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
     pass
 
 # ==================== 检测拖拽支持 ====================
 HAS_DND = False
-DND_INSTALL_AVAILABLE = False
+TkinterDnD = None
+DND_FILES = None
 
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    from tkinterdnd2 import DND_FILES as _DND_FILES, TkinterDnD as _TkinterDnD
+    TkinterDnD = _TkinterDnD
+    DND_FILES = _DND_FILES
     HAS_DND = True
 except ImportError:
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "--version"], 
-                      capture_output=True, check=True)
-        DND_INSTALL_AVAILABLE = True
-    except:
-        pass
+    pass
 
-VERSION = "1.30"
+VERSION = "1.40"
 APP_TITLE = f"YAML批量AI本地化工具 v{VERSION}"
 
 # ==================== 统一说明文本 ====================
 APP_DESCRIPTION = """一个专业的 YAML 文件批量翻译工具
 
 主要特性:
-✓ 支持7个主流AI平台API
-✓ 多线程并发翻译，速度快
-✓ 智能上下文翻译（相邻字段关联）
-✓ 可配置翻译字段（不再硬编码）
-✓ 完整的重试机制和速率限制
-✓ 文件导出功能（不覆盖源文件）
-✓ 双语输出功能（中文 | 原文）
-✓ 自定义翻译提示词
-✓ API模型自动更新
-✓ 自动生成对比报告
-✓ 翻译历史记录
-✓ 丰富的配置选项"""
+支持主流AI平台API"""
 
 # ==================== 平台预设库 ====================
 PLATFORM_PRESETS = {
@@ -77,20 +68,6 @@ PLATFORM_PRESETS = {
         'default_model': 'deepseek-chat',
         'docs_url': 'https://platform.deepseek.com/docs'
     },
-    'moonshot': {
-        'name': 'Moonshot',
-        'url': 'https://api.moonshot.cn/v1/chat/completions',
-        'models': ['moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k'],
-        'default_model': 'moonshot-v1-8k',
-        'docs_url': 'https://platform.moonshot.cn/docs'
-    },
-    'zhipu': {
-        'name': 'ZhipuAI',
-        'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-        'models': ['glm-4', 'glm-4v', 'glm-3-turbo'],
-        'default_model': 'glm-4',
-        'docs_url': 'https://open.bigmodel.cn/dev/api'
-    },
     'qwen': {
         'name': 'Qwen',
         'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
@@ -105,13 +82,6 @@ PLATFORM_PRESETS = {
         'default_model': 'claude-3-sonnet',
         'docs_url': 'https://docs.anthropic.com/claude/reference/getting-started-with-the-api'
     },
-    'xai': {
-        'name': 'xAI',
-        'url': 'https://api.x.ai/v1/chat/completions',
-        'models': ['grok-beta'],
-        'default_model': 'grok-beta',
-        'docs_url': 'https://docs.x.ai/'
-    },
     'custom': {
         'name': 'Custom',
         'url': '',
@@ -122,13 +92,21 @@ PLATFORM_PRESETS = {
 }
 
 # 默认提示词
-DEFAULT_PROMPT = """请将以下英文翻译为中文,如果已经为中文则不翻译。
+DEFAULT_PROMPT = """请将以下英文翻译为中文,如果已经为中文则不翻译。\n\n重要规则：\n1. 只返回翻译结果，不要包含其他内容\n3. 如果使用引号，用中文引号“”‘’代替\n4. 避免在翻译结果中使用英文冒号:，使用中文冒号：代替"""
 
-重要规则：
-1. 只返回翻译结果，不要包含其他内容
-2. 翻译结果中尽量避免使用双引号和单引号
-3. 如果必须使用引号，用中文引号「」『』代替
-4. 避免在翻译结果中使用英文冒号:，使用中文冒号：代替"""
+# ==================== 工具函数 ====================
+
+def open_path_in_os(path: str):
+    """跨平台打开文件或文件夹"""
+    try:
+        if platform.system() == 'Windows':
+            os.startfile(path)
+        elif platform.system() == 'Darwin':  # macOS
+            subprocess.call(['open', path])
+        else:  # Linux
+            subprocess.call(['xdg-open', path])
+    except Exception as e:
+        print(f"无法打开路径 {path}: {e}")
 
 # ==================== 数据类定义 ====================
 
@@ -138,11 +116,8 @@ class FieldRule:
     field_name: str
     enabled: bool = True
     priority: int = 0
-    context_fields: List[str] = None  # 相关联的上下文字段
-    
-    def __post_init__(self):
-        if self.context_fields is None:
-            self.context_fields = []
+    context_fields: List[str] = field(default_factory=list)
+
 
 @dataclass
 class TranslationConfig:
@@ -161,32 +136,34 @@ class TranslationConfig:
     enable_bilingual: bool = False
     bilingual_separator: str = ' | '
     bilingual_order: str = 'cn_first'
-    field_rules: List[FieldRule] = None
-    
-    def __post_init__(self):
-        if self.field_rules is None:
-            # 默认字段规则
-            self.field_rules = [
-                FieldRule('name', True, 1, ['description', 'tooltip']),
-                FieldRule('description', True, 2, ['name']),
-                FieldRule('tooltip', True, 3, ['name', 'description']),
-                FieldRule('title', True, 4, []),
-                FieldRule('label', True, 5, []),
-            ]
+    # 批量翻译配置
+    enable_batch_translation: bool = True
+    batch_size: int = 10  # 每批翻译的文本数量
+    batch_separator: str = '\n---SPLIT---\n'  # 批量翻译时的分隔符
+    field_rules: List[FieldRule] = field(default_factory=lambda: [
+        FieldRule('name', True, 1, ['description', 'tooltip']),
+        FieldRule('description', True, 2, ['name']),
+        FieldRule('tooltip', True, 3, ['name', 'description']),
+        FieldRule('title', True, 4, []),
+        FieldRule('label', True, 5, []),
+    ])
+
 
 # ==================== 优化的速率限制器 ====================
 
 class RateLimiter:
-    """优化的速率限制器 - 使用 deque 提高性能"""
+    """优化的速率限制器 - 使用 deque 提高性能，不在锁内sleep"""
     
     def __init__(self, max_requests: int = 10, time_window: int = 60):
         self.max_requests = max_requests
         self.time_window = time_window
-        self.requests = deque()  # 使用 deque 替代 list
+        self.requests = deque()
         self.lock = threading.Lock()
     
     def wait_if_needed(self):
         """如果超出限制则等待"""
+        sleep_time = 0
+        
         with self.lock:
             now = time.time()
             
@@ -194,41 +171,96 @@ class RateLimiter:
             while self.requests and now - self.requests[0] >= self.time_window:
                 self.requests.popleft()
             
-            # 如果达到限制，等待
+            # 检查是否需要等待
             if len(self.requests) >= self.max_requests:
-                sleep_time = self.time_window - (now - self.requests[0])
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                    # 清理过期记录
-                    while self.requests and time.time() - self.requests[0] >= self.time_window:
-                        self.requests.popleft()
-            
+                sleep_time = self.time_window - (now - self.requests[0]) + 0.1
+        
+        # 在锁外等待
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        
+        # 重新获取锁添加记录
+        with self.lock:
+            now = time.time()
+            while self.requests and now - self.requests[0] >= self.time_window:
+                self.requests.popleft()
             self.requests.append(now)
 
-# ==================== YAML 加载器（模块级别定义，只定义一次）====================
 
-class CustomYAMLLoader(yaml.SafeLoader):
-    """自定义 YAML 加载器，支持未知标签"""
+# 2. YAML 加载器增强 (整合 1.30)
+
+# 用于存储带标签的值
+class TaggedValue:
+    """保存带有 YAML 标签的值"""
+    def __init__(self, tag: str, value):
+        self.tag = tag
+        self.value = value
+    
+    def __repr__(self):
+        return f"TaggedValue({self.tag}, {self.value})"
+
+class FlowStyleList(list):
+    """标记需要使用流式格式的列表"""
     pass
 
-def multi_constructor(loader, tag_suffix, node):
-    """处理所有未知标签"""
-    if isinstance(node, yaml.MappingNode):
-        return loader.construct_mapping(node)
-    elif isinstance(node, yaml.SequenceNode):
-        return loader.construct_sequence(node)
-    else:
-        return loader.construct_scalar(node)
+class CustomYAMLLoader(yaml.SafeLoader):
+    """支持并保留所有未知标签 (!Link, !Color 等)和流式列表格式"""
+    pass
 
-CustomYAMLLoader.add_multi_constructor('!', multi_constructor)
+def _multi_constructor(loader, tag_suffix, node):
+    """处理自定义标签并保存标签信息"""
+    full_tag = '!' + tag_suffix
+    if isinstance(node, yaml.MappingNode):
+        value = loader.construct_mapping(node)
+        return TaggedValue(full_tag, value)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+        return TaggedValue(full_tag, value)
+    else:
+        value = loader.construct_scalar(node)
+        return TaggedValue(full_tag, value)
+
+def _construct_yaml_seq(loader, node):
+    """构建序列时检测并保留流式格式"""
+    value = loader.construct_sequence(node)
+    # 检查是否是流式格式（通过 flow_style 属性）
+    if node.flow_style:
+        return FlowStyleList(value)
+    return value
+
+CustomYAMLLoader.add_multi_constructor('!', _multi_constructor)
+CustomYAMLLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_SEQUENCE_TAG, _construct_yaml_seq)
+
+
+# 自定义 YAML Dumper 以保留格式
+class CustomYAMLDumper(yaml.SafeDumper):
+    """自定义 Dumper 以保留标签和流式列表格式"""
+    pass
+
+def _represent_tagged_value(dumper, data):
+    """表示带标签的值"""
+    if isinstance(data.value, dict):
+        return dumper.represent_mapping(data.tag, data.value)
+    elif isinstance(data.value, list):
+        return dumper.represent_sequence(data.tag, data.value)
+    else:
+        return dumper.represent_scalar(data.tag, str(data.value) if data.value else '')
+
+def _represent_flow_list(dumper, data):
+    """表示流式列表"""
+    return dumper.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=True)
+
+CustomYAMLDumper.add_representer(TaggedValue, _represent_tagged_value)
+CustomYAMLDumper.add_representer(FlowStyleList, _represent_flow_list)
+
 
 # ==================== 核心翻译器 ====================
 
 class UniversalTranslator:
     """通用翻译器 - 支持多平台API"""
     
-    # 特殊字符集合（使用 set 提高查找效率）
-    SPECIAL_CHARS = set(':{}[],&*#?|-<>=!%@`')
+    # 特殊字符集合
+    SPECIAL_CHARS = frozenset(':{}[],&*#?|-<>=!%@`')
     
     def __init__(self, api_config: Dict[str, Any], rate_limiter: RateLimiter):
         self.config = api_config
@@ -286,7 +318,7 @@ class UniversalTranslator:
         
         try:
             with self.lock:
-                time.sleep(0.1)  # 防止过快请求
+                time.sleep(0.1)
             
             response = requests.post(self.base_url, headers=headers, json=data, timeout=timeout)
             response.raise_for_status()
@@ -311,15 +343,12 @@ class UniversalTranslator:
         if not text:
             return text
         
-        # 统计引号数量
         double_quotes = text.count('"')
         single_quotes = text.count("'")
         
-        # 如果引号很少，不需要处理
         if double_quotes < 2 and single_quotes < 2:
             return text
         
-        # 找到第二个引号的位置
         quote_positions = []
         for i, char in enumerate(text):
             if char in ['"', "'"]:
@@ -327,56 +356,22 @@ class UniversalTranslator:
                 if len(quote_positions) >= 2:
                     break
         
-        # 如果找到至少两个引号，保留前两个引号之间的内容，清理后面的
         if len(quote_positions) >= 2:
             second_quote_pos = quote_positions[1]
             before = text[:second_quote_pos + 1]
             after = text[second_quote_pos + 1:]
-            # 清理后面部分的引号和冒号
             after = after.replace('"', '').replace("'", '').replace(':', '：')
             return before + after
         
         return text
     
-    def escape_yaml_value(self, text: str) -> str:
-        """转义YAML特殊字符"""
-        if not isinstance(text, str):
-            text = str(text)
-        
-        if not text:
-            return text
-        
-        # 检查是否需要引号
-        needs_quotes = False
-        
-        # 检查特殊字符
-        if any(char in self.SPECIAL_CHARS for char in text):
-            needs_quotes = True
-        
-        # 检查是否包含引号
-        if '"' in text or "'" in text:
-            needs_quotes = True
-        
-        # 检查开头是否是特殊字符
-        if text and text[0] in self.SPECIAL_CHARS:
-            needs_quotes = True
-        
-        if needs_quotes:
-            # 转义单引号
-            escaped = text.replace("'", "''")
-            return f"'{escaped}'"
-        
-        return text
-    
-    def translate(self, text: str, context_info: Optional[Dict] = None, timeout: int = 30) -> Tuple[str, Optional[str]]:
+    def translate(self, text: str, context_info: Optional[Dict] = None, 
+                  timeout: int = 30) -> Tuple[str, Optional[str]]:
         """翻译文本 - 带重试机制"""
-        # 速率限制
         self.rate_limiter.wait_if_needed()
         
-        # 构建提示词
         prompt = self._build_prompt(text, context_info)
         
-        # 重试逻辑
         max_retries = self.retry_config['max_retries']
         retry_delay = self.retry_config['retry_delay']
         
@@ -384,16 +379,13 @@ class UniversalTranslator:
             translated_text, error = self._make_request(prompt, timeout)
             
             if error is None and translated_text:
-                # 清理文本
                 translated_text = self.clean_translated_text(translated_text)
                 return translated_text, None
             
-            # 如果不是最后一次尝试，等待后重试
             if attempt < max_retries - 1:
                 time.sleep(retry_delay * (attempt + 1))
                 continue
             
-            # 最后一次尝试失败
             return text, error or "翻译失败"
         
         return text, "翻译失败"
@@ -420,6 +412,95 @@ class UniversalTranslator:
         except Exception as e:
             return False, f"连接失败: {str(e)}"
     
+    def translate_batch(self, texts: List[str], separator: str = '\n---SPLIT---\n',
+                        timeout: int = 60) -> Tuple[List[str], Optional[str]]:
+        """批量翻译多条文本 - 合并为一次API调用"""
+        if not texts:
+            return [], None
+        
+        self.rate_limiter.wait_if_needed()
+        
+        # 构建批量翻译的提示词
+        base_prompt = self.config.get('custom_prompt', DEFAULT_PROMPT)
+        numbered_texts = []
+        for i, text in enumerate(texts, 1):
+            numbered_texts.append(f"[{i}] {text}")
+        
+        combined_text = '\n'.join(numbered_texts)
+        
+        batch_prompt = f"""{base_prompt}
+
+请翻译以下多条文本，每条文本以编号 [数字] 开头。
+请逐条翻译，返回格式保持为 [数字] 翻译内容，每条占一行。
+只返回翻译结果，不要添加任何分隔符、解释或其他内容。
+
+{combined_text}"""
+        
+        max_retries = self.retry_config['max_retries']
+        retry_delay = self.retry_config['retry_delay']
+        
+        for attempt in range(max_retries):
+            translated_text, error = self._make_request(batch_prompt, timeout)
+            
+            if error is None and translated_text:
+                # 解析批量翻译结果
+                results = self._parse_batch_result(translated_text, len(texts))
+                if len(results) == len(texts):
+                    return [self.clean_translated_text(r) for r in results], None
+                else:
+                    # 解析数量不匹配，返回原文
+                    return texts, f"批量翻译结果解析失败 (期望{len(texts)}条，得到{len(results)}条)"
+            
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            
+            return texts, error or "批量翻译失败"
+        
+        return texts, "批量翻译失败"
+    
+    def _parse_batch_result(self, result: str, expected_count: int) -> List[str]:
+        """解析批量翻译结果"""
+        import re
+        results = []
+        
+        # 方法1: 尝试按编号解析 [1] [2] [3] ...（逐行匹配，避免贪婪匹配问题）
+        lines = result.strip().split('\n')
+        numbered_results = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # 匹配 [数字] 开头的行
+            match = re.match(r'^\[(\d+)\]\s*(.+)$', line)
+            if match:
+                num = int(match.group(1))
+                content = match.group(2).strip()
+                if 1 <= num <= expected_count:
+                    numbered_results[num] = content
+        
+        # 如果成功按编号解析到足够数量的结果
+        if len(numbered_results) == expected_count:
+            results = [numbered_results[i] for i in range(1, expected_count + 1)]
+            return results
+        
+        # 方法2: 尝试按非空行顺序解析（移除可能的编号前缀）
+        cleaned_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # 移除 [数字] 或 数字. 或 数字) 或 数字: 等前缀
+            cleaned = re.sub(r'^[\[（\(]?\d+[\]）\)\.\:：]?\s*', '', line)
+            if cleaned:
+                cleaned_lines.append(cleaned)
+        
+        if len(cleaned_lines) == expected_count:
+            results = cleaned_lines
+        
+        return results
+
     @staticmethod
     def fetch_available_models(platform_id: str, api_key: str, base_url: str, 
                                timeout: int = 15) -> Tuple[Optional[List[str]], Optional[str]]:
@@ -428,7 +509,6 @@ class UniversalTranslator:
             if not api_key or not base_url:
                 return None, "API Key 或 URL 不能为空"
             
-            # 构建模型列表URL
             if '/chat/completions' in base_url:
                 models_url = base_url.replace('/chat/completions', '/models')
             elif '/v1/' in base_url:
@@ -458,6 +538,7 @@ class UniversalTranslator:
         except Exception as e:
             return None, f"获取模型失败: {str(e)}"
 
+
 # ==================== 字段提取器 ====================
 
 class FieldExtractor:
@@ -477,17 +558,13 @@ class FieldExtractor:
         return rule.context_fields if rule else []
     
     def extract_fields(self, data: Any, path_prefix: str = '') -> List[Dict[str, Any]]:
-        """
-        提取所有需要翻译的字段
-        返回: [{'path': '字段路径', 'field_name': '字段名', 'value': '值', 'parent': 父节点}]
-        """
+        """提取所有需要翻译的字段"""
         fields = []
         
         if isinstance(data, dict):
             for key, value in data.items():
                 current_path = f"{path_prefix}.{key}" if path_prefix else key
                 
-                # 如果是需要翻译的字段
                 if self.should_translate(key) and isinstance(value, str) and value.strip():
                     fields.append({
                         'path': current_path,
@@ -496,8 +573,6 @@ class FieldExtractor:
                         'parent': data,
                         'priority': self.field_priorities.get(key, 999)
                     })
-                
-                # 递归处理嵌套结构
                 elif isinstance(value, (dict, list)):
                     fields.extend(self.extract_fields(value, current_path))
         
@@ -507,31 +582,24 @@ class FieldExtractor:
                 if isinstance(item, (dict, list)):
                     fields.extend(self.extract_fields(item, current_path))
         
-        # 按优先级排序
         fields.sort(key=lambda x: x['priority'])
         return fields
     
     def build_context(self, field_info: Dict[str, Any], all_fields: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        为字段构建上下文信息
-        只包含相邻的相关字段
-        """
+        """为字段构建上下文信息"""
         context = {
             'field_name': field_info['field_name'],
             'related_fields': {}
         }
         
-        # 获取需要关联的字段名列表
         context_field_names = self.get_context_fields(field_info['field_name'])
         if not context_field_names:
             return context
         
-        # 获取父节点
         parent = field_info['parent']
         if not isinstance(parent, dict):
             return context
         
-        # 只提取同一父节点下的相关字段
         for context_field_name in context_field_names:
             if context_field_name in parent and isinstance(parent[context_field_name], str):
                 value = parent[context_field_name].strip()
@@ -540,14 +608,15 @@ class FieldExtractor:
         
         return context
 
+
 # ==================== YAML翻译核心 ====================
 
 class YamlTranslatorCore:
-    """YAML翻译核心 - 重构版"""
+    """YAML翻译核心"""
     
     def __init__(self, api_config: Dict[str, Any], translation_config: TranslationConfig,
-                 max_threads: int = 4, progress_callback=None, log_callback=None, 
-                 translation_callback=None):
+                 max_threads: int = 4, progress_callback: Callable = None, 
+                 log_callback: Callable = None, translation_callback: Callable = None):
         
         self.rate_limiter = RateLimiter(max_requests=10, time_window=60)
         self.translator = UniversalTranslator(api_config, self.rate_limiter)
@@ -630,7 +699,9 @@ class YamlTranslatorCore:
                     self.log(f"备份创建失败: {e}", "WARNING")
             return original_path
         
-        output_folder = self.config.output_folder or os.path.join(os.path.dirname(original_path), 'translated')
+        output_folder = self.config.output_folder or os.path.join(
+            os.path.dirname(original_path), 'translated'
+        )
         
         if self.config.keep_structure:
             rel_path = os.path.relpath(original_path, base_folder)
@@ -660,12 +731,104 @@ class YamlTranslatorCore:
         return output_path
     
     def translate_fields(self, fields: List[Dict[str, Any]], file_path: str) -> Tuple[int, int, int]:
-        """
-        翻译提取的字段列表
-        返回: (成功数, 跳过数, 失败数)
-        """
+        """翻译提取的字段列表 - 支持批量翻译模式"""
         successful = 0
         skipped = 0
+        failed = 0
+        
+        # 分离需要翻译和跳过的字段
+        to_translate = []
+        for field_info in fields:
+            if self.stop_flag.is_set():
+                break
+            
+            original_value = field_info['value']
+            
+            if self.config.skip_chinese and self.contains_chinese(original_value):
+                skipped += 1
+                self.record_translation(file_path, field_info['path'], original_value, original_value, 'skipped')
+            else:
+                to_translate.append(field_info)
+        
+        if not to_translate:
+            return successful, skipped, failed
+        
+        # 判断是否使用批量翻译
+        enable_batch = getattr(self.config, 'enable_batch_translation', True)
+        batch_size = getattr(self.config, 'batch_size', 10)
+        batch_separator = getattr(self.config, 'batch_separator', '\n---SPLIT---\n')
+        
+        if enable_batch and len(to_translate) > 1:
+            # 批量翻译模式
+            successful, failed = self._translate_batch_mode(
+                to_translate, file_path, batch_size, batch_separator
+            )
+        else:
+            # 单条翻译模式
+            successful, failed = self._translate_single_mode(to_translate, file_path)
+        
+        return successful, skipped, failed
+    
+    def _translate_batch_mode(self, fields: List[Dict[str, Any]], file_path: str,
+                              batch_size: int, separator: str) -> Tuple[int, int]:
+        """批量翻译模式"""
+        successful = 0
+        failed = 0
+        
+        # 分批处理
+        for i in range(0, len(fields), batch_size):
+            if self.stop_flag.is_set():
+                break
+            
+            batch = fields[i:i + batch_size]
+            texts = [f['value'] for f in batch]
+            
+            self.log(f"批量翻译: 第 {i//batch_size + 1} 批 ({len(batch)} 条)", "INFO")
+            
+            # 执行批量翻译
+            translated_texts, error = self.translator.translate_batch(
+                texts, separator, self.config.api_timeout * 2  # 批量翻译超时时间加倍
+            )
+            
+            if error:
+                self.log(f"批量翻译失败，回退到单条模式: {error}", "WARNING")
+                # 回退到单条翻译
+                s, f = self._translate_single_mode(batch, file_path)
+                successful += s
+                failed += f
+            else:
+                # 应用翻译结果
+                for j, (field_info, translated) in enumerate(zip(batch, translated_texts)):
+                    field_name = field_info['field_name']
+                    field_path = field_info['path']
+                    original_value = field_info['value']
+                    parent = field_info['parent']
+                    
+                    if translated and translated != original_value:
+                        successful += 1
+                        if self.translation_callback:
+                            self.translation_callback(original_value, translated)
+                        
+                        # 应用双语设置
+                        if self.config.enable_bilingual:
+                            sep = self.config.bilingual_separator
+                            if self.config.bilingual_order == 'cn_first':
+                                parent[field_name] = f"{translated}{sep}{original_value}"
+                            else:
+                                parent[field_name] = f"{original_value}{sep}{translated}"
+                        else:
+                            parent[field_name] = translated
+                        
+                        self.record_translation(file_path, field_path, original_value, parent[field_name], 'success')
+                    else:
+                        failed += 1
+                        self.record_translation(file_path, field_path, original_value, original_value, 'failed')
+        
+        return successful, failed
+    
+    def _translate_single_mode(self, fields: List[Dict[str, Any]], file_path: str) -> Tuple[int, int]:
+        """单条翻译模式"""
+        successful = 0
         failed = 0
         
         for field_info in fields:
@@ -677,17 +840,11 @@ class YamlTranslatorCore:
             original_value = field_info['value']
             parent = field_info['parent']
             
-            # 检查是否跳过中文
-            if self.config.skip_chinese and self.contains_chinese(original_value):
-                skipped += 1
-                self.record_translation(file_path, field_path, original_value, original_value, 'skipped')
-                continue
-            
-            # 构建上下文
             context = self.field_extractor.build_context(field_info, fields)
             
-            # 翻译
-            translated_value, error = self.translator.translate(original_value, context)
+            translated_value, error = self.translator.translate(
+                original_value, context, self.config.api_timeout
+            )
             
             if error:
                 failed += 1
@@ -698,7 +855,6 @@ class YamlTranslatorCore:
                 if self.translation_callback:
                     self.translation_callback(original_value, translated_value)
                 
-                # 应用双语输出
                 if self.config.enable_bilingual and translated_value != original_value:
                     sep = self.config.bilingual_separator
                     if self.config.bilingual_order == 'cn_first':
@@ -710,7 +866,7 @@ class YamlTranslatorCore:
                 
                 self.record_translation(file_path, field_path, original_value, parent[field_name], 'success')
         
-        return successful, skipped, failed
+        return successful, failed
     
     def process_yaml_file(self, file_path: str, base_folder: str):
         """处理单个YAML文件"""
@@ -721,7 +877,6 @@ class YamlTranslatorCore:
         self.log(f"处理文件: {file_name}")
         
         try:
-            # 加载YAML文件
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = yaml.load(f, Loader=CustomYAMLLoader)
             
@@ -729,7 +884,6 @@ class YamlTranslatorCore:
                 self.log(f"文件为空或格式不正确: {file_name}", "WARNING")
                 return
             
-            # 提取需要翻译的字段
             fields = self.field_extractor.extract_fields(data)
             
             if not fields:
@@ -738,17 +892,14 @@ class YamlTranslatorCore:
             
             self.log(f"找到 {len(fields)} 个待翻译字段", "INFO")
             
-            # 翻译字段
             successful, skipped, failed = self.translate_fields(fields, file_path)
             
-            # 保存文件
             output_path = self.get_output_path(file_path, base_folder)
             
             with open(output_path, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True, sort_keys=False, 
-                         default_flow_style=False, indent=2)
+                yaml.dump(data, f, Dumper=CustomYAMLDumper, allow_unicode=True, 
+                         sort_keys=False, default_flow_style=False, indent=2)
             
-            # 更新统计
             with self.stats_lock:
                 self.stats['processed_files'] += 1
                 self.stats['successful_translations'] += successful
@@ -795,29 +946,32 @@ class YamlTranslatorCore:
         self.log(f"开始翻译 {len(file_paths)} 个文件")
         self.log(f"线程数: {self.max_threads}")
         self.log(f"输出模式: {'覆盖源文件' if self.config.output_mode == 'overwrite' else '导出到新文件夹'}")
+        
         if self.config.enable_bilingual:
             order_text = "中文在前" if self.config.bilingual_order == 'cn_first' else "原文在前"
             sep = self.config.bilingual_separator
             self.log(f"双语输出: 已启用 ({order_text}，分隔符: '{sep}')")
         
-        # 显示字段配置
         enabled_fields = [rule.field_name for rule in self.config.field_rules if rule.enabled]
         self.log(f"翻译字段: {', '.join(enabled_fields)}")
         self.log("=" * 60)
         
-        # 多线程处理
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-            futures = [executor.submit(self.process_yaml_file, file_path, base_folder) 
-                      for file_path in file_paths]
+            future_to_file = {
+                executor.submit(self.process_yaml_file, fp, base_folder): fp 
+                for fp in file_paths
+            }
             
-            for i, future in enumerate(futures):
+            completed = 0
+            for future in as_completed(future_to_file):
                 if self.stop_flag.is_set():
                     break
                 try:
                     future.result()
                 except Exception as e:
                     self.log(f"线程执行错误: {e}", "ERROR")
-                self.update_progress(i + 1, len(file_paths), f"处理中: {i + 1}/{len(file_paths)}")
+                completed += 1
+                self.update_progress(completed, len(file_paths), f"处理中: {completed}/{len(file_paths)}")
         
         self.stats['end_time'] = datetime.now()
         elapsed = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
@@ -837,12 +991,20 @@ class YamlTranslatorCore:
         """停止翻译"""
         self.stop_flag.set()
 
+
 # ==================== 配置管理器 ====================
 
 class ConfigManager:
     """配置管理器"""
     
-    def __init__(self, config_file: str = "translator_config.json"):
+    def __init__(self, config_file: str = None):
+        if config_file is None:
+            if getattr(sys, 'frozen', False):
+                app_dir = os.path.dirname(sys.executable)
+            else:
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+            config_file = os.path.join(app_dir, "translator_config.json")
+        
         self.config_file = config_file
         self.config = self.load_config()
     
@@ -868,6 +1030,10 @@ class ConfigManager:
             'enable_bilingual': False,
             'bilingual_separator': ' | ',
             'bilingual_order': 'cn_first',
+            # 批量翻译配置
+            'enable_batch_translation': True,
+            'batch_size': 10,
+            'batch_separator': '\n---SPLIT---\n',
             'preset_tags': [
                 {'tag': '_zh_CN', 'label': '简体中文'},
                 {'tag': '_zh_TW', 'label': '繁体中文'},
@@ -883,13 +1049,17 @@ class ConfigManager:
             'save_history': True,
             'max_history': 100,
             'history': [],
-            # 字段规则配置
             'field_rules': [
-                {'field_name': 'name', 'enabled': True, 'priority': 1, 'context_fields': ['description', 'tooltip']},
-                {'field_name': 'description', 'enabled': True, 'priority': 2, 'context_fields': ['name']},
-                {'field_name': 'tooltip', 'enabled': True, 'priority': 3, 'context_fields': ['name', 'description']},
-                {'field_name': 'title', 'enabled': True, 'priority': 4, 'context_fields': []},
-                {'field_name': 'label', 'enabled': True, 'priority': 5, 'context_fields': []},
+                {'field_name': 'name', 'enabled': True, 'priority': 1, 
+                 'context_fields': ['description', 'tooltip']},
+                {'field_name': 'description', 'enabled': True, 'priority': 2, 
+                 'context_fields': ['name']},
+                {'field_name': 'tooltip', 'enabled': True, 'priority': 3, 
+                 'context_fields': ['name', 'description']},
+                {'field_name': 'title', 'enabled': True, 'priority': 4, 
+                 'context_fields': []},
+                {'field_name': 'label', 'enabled': True, 'priority': 5, 
+                 'context_fields': []},
             ]
         }
     
@@ -911,7 +1081,7 @@ class ConfigManager:
         """保存配置"""
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, indent=2, fp=f, ensure_ascii=False)
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
             return True
         except Exception as e:
             print(f"保存配置失败: {e}")
@@ -943,8 +1113,73 @@ class ConfigManager:
             enable_bilingual=self.config.get('enable_bilingual', False),
             bilingual_separator=self.config.get('bilingual_separator', ' | '),
             bilingual_order=self.config.get('bilingual_order', 'cn_first'),
+            enable_batch_translation=self.config.get('enable_batch_translation', True),
+            batch_size=self.config.get('batch_size', 10),
+            batch_separator=self.config.get('batch_separator', '\n---SPLIT---\n'),
             field_rules=field_rules
         )
+    
+    def export_config(self, export_path: str, include_api_keys: bool = False) -> Tuple[bool, str]:
+        """导出配置到文件"""
+        try:
+            export_data = self.config.copy()
+            
+            # 根据选项决定是否导出API Keys
+            if not include_api_keys:
+                export_data['api_keys'] = []
+                export_data['current_key_id'] = None
+            
+            # 不导出历史记录
+            export_data['history'] = []
+            
+            with open(export_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+            
+            return True, f"配置已导出到: {export_path}"
+        except Exception as e:
+            return False, f"导出失败: {str(e)}"
+    
+    def import_config(self, import_path: str, merge_mode: bool = True) -> Tuple[bool, str]:
+        """从文件导入配置
+        
+        Args:
+            import_path: 导入文件路径
+            merge_mode: True=合并模式(保留现有API Keys), False=覆盖模式
+        """
+        try:
+            with open(import_path, 'r', encoding='utf-8') as f:
+                imported = json.load(f)
+            
+            if merge_mode:
+                # 合并模式：保留现有的API Keys和历史记录
+                existing_keys = self.config.get('api_keys', [])
+                existing_key_id = self.config.get('current_key_id')
+                existing_history = self.config.get('history', [])
+                
+                # 更新配置
+                self.config.update(imported)
+                
+                # 恢复API Keys（如果导入的配置中没有）
+                if not imported.get('api_keys'):
+                    self.config['api_keys'] = existing_keys
+                    self.config['current_key_id'] = existing_key_id
+                
+                # 合并历史记录
+                if existing_history:
+                    imported_history = imported.get('history', [])
+                    self.config['history'] = imported_history + existing_history
+                    max_history = self.config.get('max_history', 100)
+                    self.config['history'] = self.config['history'][:max_history]
+            else:
+                # 覆盖模式
+                self.config = imported
+            
+            self.save_config()
+            return True, "配置导入成功"
+        except json.JSONDecodeError:
+            return False, "导入失败: 文件格式错误，不是有效的JSON"
+        except Exception as e:
+            return False, f"导入失败: {str(e)}"
     
     def add_api_key(self, key_data: Dict[str, Any]) -> str:
         """添加 API Key"""
@@ -1020,12 +1255,12 @@ class ConfigManager:
         
         self.save_config()
 
-# ==================== 报告生成器（HTML模板提取）====================
+
+# ==================== 报告生成器 ====================
 
 class ReportGenerator:
     """翻译报告生成器"""
     
-    # HTML模板常量
     HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -1046,14 +1281,8 @@ class ReportGenerator:
             margin-bottom: 20px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }}
-        .header h1 {{
-            font-size: 28px;
-            margin-bottom: 10px;
-        }}
-        .header p {{
-            opacity: 0.9;
-            margin: 5px 0;
-        }}
+        .header h1 {{ font-size: 28px; margin-bottom: 10px; }}
+        .header p {{ opacity: 0.9; margin: 5px 0; }}
         .stats {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -1073,10 +1302,7 @@ class ReportGenerator:
             color: #667eea;
             margin-bottom: 5px;
         }}
-        .stat-label {{
-            color: #666;
-            font-size: 14px;
-        }}
+        .stat-label {{ color: #666; font-size: 14px; }}
         .file-section {{
             background: white;
             margin-bottom: 15px;
@@ -1089,16 +1315,8 @@ class ReportGenerator:
             padding-bottom: 10px;
             margin-bottom: 15px;
         }}
-        .file-title {{
-            font-size: 18px;
-            font-weight: bold;
-            color: #333;
-            margin-bottom: 5px;
-        }}
-        .file-info {{
-            color: #666;
-            font-size: 13px;
-        }}
+        .file-title {{ font-size: 18px; font-weight: bold; color: #333; margin-bottom: 5px; }}
+        .file-info {{ color: #666; font-size: 13px; }}
         .translation-item {{
             border-left: 3px solid #4CAF50;
             padding: 12px;
@@ -1106,24 +1324,10 @@ class ReportGenerator:
             background: #fafafa;
             border-radius: 4px;
         }}
-        .translation-item.failed {{
-            border-left-color: #f44336;
-            background: #ffebee;
-        }}
-        .translation-item.skipped {{
-            border-left-color: #FF9800;
-            background: #fff3e0;
-        }}
-        .original {{
-            color: #666;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }}
-        .translated {{
-            color: #000;
-            font-weight: 500;
-            font-size: 14px;
-        }}
+        .translation-item.failed {{ border-left-color: #f44336; background: #ffebee; }}
+        .translation-item.skipped {{ border-left-color: #FF9800; background: #fff3e0; }}
+        .original {{ color: #666; margin-bottom: 8px; font-size: 14px; }}
+        .translated {{ color: #000; font-weight: 500; font-size: 14px; }}
         .status-badge {{
             display: inline-block;
             padding: 2px 8px;
@@ -1131,24 +1335,10 @@ class ReportGenerator:
             font-size: 12px;
             margin-left: 10px;
         }}
-        .status-success {{
-            background: #4CAF50;
-            color: white;
-        }}
-        .status-failed {{
-            background: #f44336;
-            color: white;
-        }}
-        .status-skipped {{
-            background: #FF9800;
-            color: white;
-        }}
-        .footer {{
-            text-align: center;
-            color: #999;
-            margin-top: 30px;
-            padding: 20px;
-        }}
+        .status-success {{ background: #4CAF50; color: white; }}
+        .status-failed {{ background: #f44336; color: white; }}
+        .status-skipped {{ background: #FF9800; color: white; }}
+        .footer {{ text-align: center; color: #999; margin-top: 30px; padding: 20px; }}
     </style>
 </head>
 <body>
@@ -1157,7 +1347,6 @@ class ReportGenerator:
         <p>生成时间: {timestamp}</p>
         <p>使用平台: {platform} ({model})</p>
     </div>
-    
     <div class="stats">
         <div class="stat-card">
             <div class="stat-number">{total_files}</div>
@@ -1180,9 +1369,7 @@ class ReportGenerator:
             <div class="stat-label">总耗时</div>
         </div>
     </div>
-    
     {file_sections}
-    
     <div class="footer">
         <p>由 {app_name} 生成</p>
     </div>
@@ -1226,7 +1413,6 @@ class ReportGenerator:
     def generate_html_report(stats: Dict[str, Any], translation_records: List[Dict[str, Any]], 
                             output_path: str, api_config: Dict[str, Any]) -> Optional[str]:
         """生成HTML对比报告"""
-        # 按文件分组记录
         files_data = {}
         for record in translation_records:
             file_path = record['file']
@@ -1234,14 +1420,14 @@ class ReportGenerator:
                 files_data[file_path] = []
             files_data[file_path].append(record)
         
-        # 构建所有文件部分的HTML
         file_sections_html = ""
         for file_path, records in files_data.items():
             file_sections_html += ReportGenerator._build_file_section(file_path, records)
         
-        # 填充模板
         duration_str = f"{stats.get('duration', 0):.1f}秒"
-        platform_name = PLATFORM_PRESETS.get(api_config.get('platform', 'deepseek'), {}).get('name', '未知')
+        platform_name = PLATFORM_PRESETS.get(
+            api_config.get('platform', 'deepseek'), {}
+        ).get('name', '未知')
         
         html_content = ReportGenerator.HTML_TEMPLATE.format(
             timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1264,7 +1450,8 @@ class ReportGenerator:
             print(f"报告生成失败: {e}")
             return None
 
-# ==================== GUI基类和工具 ====================
+
+# ==================== GUI基类 ====================
 
 class BaseDialog:
     """对话框基类"""
@@ -1290,16 +1477,17 @@ class BaseDialog:
         """关闭对话框"""
         self.dialog.destroy()
 
+
 # ==================== 字段配置对话框 ====================
 
 class FieldConfigDialog(BaseDialog):
     """字段配置管理对话框"""
     
-    def __init__(self, parent: tk.Tk, config_manager: ConfigManager, callback=None):
+    def __init__(self, parent: tk.Tk, config_manager: ConfigManager, callback: Callable = None):
         super().__init__(parent, "字段配置管理", 800, 600)
         self.config_manager = config_manager
         self.callback = callback
-        self.field_rules = self.config_manager.config.get('field_rules', []).copy()
+        self.field_rules = [dict(r) for r in self.config_manager.config.get('field_rules', [])]
         
         self.setup_ui()
         self.load_field_rules()
@@ -1315,7 +1503,6 @@ class FieldConfigDialog(BaseDialog):
         title_frame.grid(row=0, column=0, sticky='ew')
         ttk.Label(title_frame, text="字段配置管理", 
                  font=('Microsoft YaHei UI', 11, 'bold')).pack(side=tk.LEFT)
-        
         ttk.Label(title_frame, text="配置需要翻译的字段及其上下文关联", 
                  font=('Microsoft YaHei UI', 9),
                  foreground='gray').pack(side=tk.LEFT, padx=(15, 0))
@@ -1428,9 +1615,8 @@ class FieldConfigDialog(BaseDialog):
         for i, rule in enumerate(self.field_rules):
             if rule['field_name'] == field_name and i > 0:
                 self.field_rules[i], self.field_rules[i-1] = self.field_rules[i-1], self.field_rules[i]
-                # 更新优先级
                 self.field_rules[i]['priority'] = i
-                self.field_rules[i-1]['priority'] = i-1
+                self.field_rules[i-1]['priority'] = i - 1
                 self.load_field_rules()
                 break
     
@@ -1446,13 +1632,12 @@ class FieldConfigDialog(BaseDialog):
         for i, rule in enumerate(self.field_rules):
             if rule['field_name'] == field_name and i < len(self.field_rules) - 1:
                 self.field_rules[i], self.field_rules[i+1] = self.field_rules[i+1], self.field_rules[i]
-                # 更新优先级
                 self.field_rules[i]['priority'] = i
-                self.field_rules[i+1]['priority'] = i+1
+                self.field_rules[i+1]['priority'] = i + 1
                 self.load_field_rules()
                 break
     
-    def show_field_editor(self, rule_data=None):
+    def show_field_editor(self, rule_data: Dict = None):
         """显示字段编辑器"""
         is_edit = rule_data is not None
         
@@ -1465,12 +1650,10 @@ class FieldConfigDialog(BaseDialog):
         editor.rowconfigure(1, weight=1)
         editor.columnconfigure(0, weight=1)
         
-        # 标题
         ttk.Label(editor, text="编辑字段配置" if is_edit else "添加字段配置",
                  font=('Microsoft YaHei UI', 10, 'bold'),
                  padding="15").grid(row=0, column=0, sticky='ew')
         
-        # 表单
         form = ttk.Frame(editor, padding="20")
         form.grid(row=1, column=0, sticky='nsew')
         
@@ -1492,9 +1675,6 @@ class FieldConfigDialog(BaseDialog):
         priority_var = tk.IntVar(value=rule_data.get('priority', 0) if is_edit else len(self.field_rules))
         ttk.Spinbox(form, from_=0, to=100, textvariable=priority_var, width=10).grid(
             row=2, column=1, sticky=tk.W, pady=8)
-        ttk.Label(form, text="(数字越小优先级越高)", 
-                 foreground='gray', font=('Microsoft YaHei UI', 8)).grid(
-            row=2, column=1, sticky=tk.E, pady=8)
         
         # 上下文字段
         ttk.Label(form, text="上下文字段:").grid(row=3, column=0, sticky=tk.NW, pady=8)
@@ -1508,9 +1688,9 @@ class FieldConfigDialog(BaseDialog):
         if is_edit and rule_data.get('context_fields'):
             context_text.insert('1.0', '\n'.join(rule_data['context_fields']))
         
-        ttk.Label(form, text="每行一个字段名\n这些字段的值会作为翻译上下文", 
-                 foreground='gray', font=('Microsoft YaHei UI', 8),
-                 justify=tk.LEFT).grid(row=4, column=1, sticky=tk.W, pady=(0, 8))
+        ttk.Label(form, text="每行一个字段名", 
+                 foreground='gray', font=('Microsoft YaHei UI', 8)).grid(
+            row=4, column=1, sticky=tk.W, pady=(0, 8))
         
         form.columnconfigure(1, weight=1)
         
@@ -1524,14 +1704,12 @@ class FieldConfigDialog(BaseDialog):
                 messagebox.showwarning("警告", "请输入字段名", parent=editor)
                 return
             
-            # 检查重复
             if not is_edit:
                 for rule in self.field_rules:
                     if rule['field_name'] == field_name:
                         messagebox.showwarning("警告", "字段名已存在", parent=editor)
                         return
             
-            # 解析上下文字段
             context_fields = []
             for line in context_text.get('1.0', tk.END).strip().split('\n'):
                 line = line.strip()
@@ -1546,13 +1724,11 @@ class FieldConfigDialog(BaseDialog):
             }
             
             if is_edit:
-                # 更新现有规则
                 for i, rule in enumerate(self.field_rules):
                     if rule['field_name'] == field_name:
                         self.field_rules[i] = new_rule
                         break
             else:
-                # 添加新规则
                 self.field_rules.append(new_rule)
             
             self.load_field_rules()
@@ -1572,12 +1748,13 @@ class FieldConfigDialog(BaseDialog):
         messagebox.showinfo("成功", "字段配置已保存", parent=self.dialog)
         self.destroy()
 
+
 # ==================== API Key管理对话框 ====================
 
 class KeyManagerDialog(BaseDialog):
     """API Key管理对话框"""
     
-    def __init__(self, parent: tk.Tk, config_manager: ConfigManager, callback=None):
+    def __init__(self, parent: tk.Tk, config_manager: ConfigManager, callback: Callable = None):
         super().__init__(parent, "API Key 管理", 800, 500)
         self.config_manager = config_manager
         self.callback = callback
@@ -1591,13 +1768,11 @@ class KeyManagerDialog(BaseDialog):
         self.dialog.rowconfigure(1, weight=1)
         self.dialog.columnconfigure(0, weight=1)
         
-        # 标题
         title_frame = ttk.Frame(self.dialog, padding="15 15 15 10")
         title_frame.grid(row=0, column=0, sticky='ew')
         ttk.Label(title_frame, text="API Key 管理", 
                  font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor=tk.W)
         
-        # 列表
         list_frame = ttk.Frame(self.dialog, padding="0 0 15 10")
         list_frame.grid(row=1, column=0, sticky='nsew', padx=15)
         list_frame.rowconfigure(0, weight=1)
@@ -1621,7 +1796,6 @@ class KeyManagerDialog(BaseDialog):
         self.tree.grid(row=0, column=0, sticky='nsew')
         scrollbar.grid(row=0, column=1, sticky='ns')
         
-        # 按钮
         btn_frame = ttk.Frame(self.dialog, padding="15")
         btn_frame.grid(row=2, column=0, sticky='ew')
         
@@ -1629,7 +1803,7 @@ class KeyManagerDialog(BaseDialog):
         ttk.Button(btn_frame, text="编辑", command=self.edit_key, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="测试", command=self.test_key, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="删除", command=self.remove_key, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="关闭", command=self.destroy, width=12).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="关闭", command=self.on_close, width=12).pack(side=tk.RIGHT, padx=5)
     
     def refresh_tree(self):
         """刷新列表"""
@@ -1645,7 +1819,7 @@ class KeyManagerDialog(BaseDialog):
     
     def add_key(self):
         """添加Key"""
-        KeyEditorDialog(self.dialog, self.config_manager, None, self.refresh_tree)
+        KeyEditorDialog(self.dialog, self.config_manager, None, self.on_key_changed)
     
     def edit_key(self):
         """编辑Key"""
@@ -1659,8 +1833,14 @@ class KeyManagerDialog(BaseDialog):
         
         for k in self.config_manager.get_api_keys():
             if k['name'] == key_name:
-                KeyEditorDialog(self.dialog, self.config_manager, k, self.refresh_tree)
+                KeyEditorDialog(self.dialog, self.config_manager, k, self.on_key_changed)
                 break
+    
+    def on_key_changed(self):
+        """Key变更回调"""
+        self.refresh_tree()
+        if self.callback:
+            self.callback()
     
     def test_key(self):
         """测试Key"""
@@ -1763,16 +1943,22 @@ class KeyManagerDialog(BaseDialog):
                     self.config_manager.remove_api_key(k['id'])
                     break
             
-            self.refresh_tree()
-            if self.callback:
-                self.callback()
+            self.on_key_changed()
+    
+    def on_close(self):
+        """关闭对话框"""
+        if self.callback:
+            self.callback()
+        self.destroy()
+
 
 # ==================== API Key编辑对话框 ====================
 
 class KeyEditorDialog(BaseDialog):
     """API Key编辑对话框"""
     
-    def __init__(self, parent, config_manager: ConfigManager, key_data: Optional[Dict] = None, callback=None):
+    def __init__(self, parent, config_manager: ConfigManager, 
+                 key_data: Optional[Dict] = None, callback: Callable = None):
         is_edit = key_data is not None
         title = "编辑 API Key" if is_edit else "添加 API Key"
         super().__init__(parent, title, 600, 750)
@@ -1790,13 +1976,11 @@ class KeyEditorDialog(BaseDialog):
         self.dialog.rowconfigure(1, weight=1)
         self.dialog.columnconfigure(0, weight=1)
         
-        # 标题
         ttk.Label(self.dialog, 
                  text="编辑 API Key" if self.is_edit else "添加 API Key",
                  font=('Microsoft YaHei UI', 11, 'bold'),
                  padding="20 20 20 10").grid(row=0, column=0)
         
-        # 创建滚动区域
         canvas = tk.Canvas(self.dialog, highlightthickness=0)
         canvas.grid(row=1, column=0, sticky='nsew', padx=15, pady=10)
         
@@ -1814,7 +1998,6 @@ class KeyEditorDialog(BaseDialog):
         
         canvas.bind('<Configure>', on_canvas_configure)
         
-        # 表单字段
         row = 0
         
         # 名称
@@ -1889,7 +2072,7 @@ class KeyEditorDialog(BaseDialog):
             name = PLATFORM_PRESETS.get(platform_id, {}).get('name', '')
             self.platform_combo.set(name)
         else:
-            self.platform_combo.current(1)  # 默认 DeepSeek
+            self.platform_combo.current(1)
         
         self.on_platform_change()
         
@@ -2014,15 +2197,23 @@ class KeyEditorDialog(BaseDialog):
         
         self.destroy()
 
-# ==================== 设置对话框 ====================
+
+# ==================== 设置对话框 (完全重构支持滚动) ====================
 
 class SettingsDialog(BaseDialog):
-    """设置对话框"""
+    """设置对话框 - 修复了嵌套滚动和鼠标滚轮支持，支持窗口大小调整"""
     
-    def __init__(self, parent: tk.Tk, config_manager: ConfigManager, callback=None):
-        super().__init__(parent, "设置", 700, 700)
+    def __init__(self, parent: tk.Tk, config_manager: ConfigManager, callback: Callable = None, initial_tab=0):
+        super().__init__(parent, "设置", 720, 800)  # 增大初始高度
         self.config_manager = config_manager
         self.callback = callback
+        self.initial_tab = initial_tab
+        
+        # 设置窗口最小尺寸，防止内容被裁剪
+        self.dialog.minsize(600, 500)
+        
+        # 允许窗口调整大小
+        self.dialog.resizable(True, True)
         
         self.setup_ui()
         self.load_settings()
@@ -2030,35 +2221,146 @@ class SettingsDialog(BaseDialog):
     
     def setup_ui(self):
         """设置UI"""
+        # 使根窗口自适应
         self.dialog.rowconfigure(1, weight=1)
         self.dialog.columnconfigure(0, weight=1)
         
-        # 标题
+        # 1. 顶部标题 (不滚动)
         title_frame = ttk.Frame(self.dialog, padding="15 15 15 10")
         title_frame.grid(row=0, column=0, sticky='ew')
-        ttk.Label(title_frame, text="设置", 
-                 font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor=tk.W)
         
-        # Notebook
-        notebook = ttk.Notebook(self.dialog)
-        notebook.grid(row=1, column=0, sticky='nsew', padx=15, pady=(0, 10))
+        title_row = ttk.Frame(title_frame)
+        title_row.pack(fill=tk.X)
         
-        # 输出设置选项卡
-        self.create_output_tab(notebook)
+        ttk.Label(title_row, text="设置中心", 
+                 font=('Microsoft YaHei UI', 12, 'bold')).pack(side=tk.LEFT)
         
-        # 翻译设置选项卡
-        self.create_translation_tab(notebook)
+        # 添加提示信息
+        ttk.Label(title_row, text="(可调整窗口大小，滚动查看更多选项)", 
+                 font=('Microsoft YaHei UI', 8), foreground='gray').pack(side=tk.LEFT, padx=(15, 0))
         
-        # 界面设置选项卡
-        self.create_ui_tab(notebook)
+        # 2. 中间滚动区域容器
+        container = ttk.Frame(self.dialog)
+        container.grid(row=1, column=0, sticky='nsew', padx=5)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        # 创建 Canvas 和 Scrollbar
+        self.canvas = tk.Canvas(container, highlightthickness=0, bg='#f0f0f0')
+        self.scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
         
-        # 按钮
+        # 内容框架 (承载所有 Tab)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        
+        # 绑定滚动区域更新
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self._update_scroll_region()
+        )
+
+        # 在 Canvas 中创建窗口
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        
+        # 让内部 Frame 宽度随 Canvas 变化
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        # 布局 Canvas 组件
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # --- 核心修复：绑定鼠标滚轮到 Canvas ---
+        self._bind_mousewheel(self.canvas)
+        # 递归绑定所有子组件，确保鼠标在按钮或输入框上时也能滚动
+        self._bind_mousewheel_recursive(self.scrollable_frame)
+
+        # 3. 创建 Tab 控件 (放在滚动框架内)
+        self.notebook = ttk.Notebook(self.scrollable_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.create_output_tab(self.notebook)
+        self.create_translation_tab(self.notebook)
+        self.create_ui_tab(self.notebook)
+        
+        if 0 <= self.initial_tab < len(self.notebook.tabs()):
+            self.notebook.select(self.initial_tab)
+            
+        # 4. 底部按钮 (固定不滚动)
         btn_frame = ttk.Frame(self.dialog, padding="15")
         btn_frame.grid(row=2, column=0, sticky='ew')
         
-        ttk.Button(btn_frame, text="保存", command=self.save_settings, 
-                  width=12, style='Accent.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="保存设置", command=self.save_settings, 
+                  width=15, style='Accent.TButton').pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=self.destroy, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="恢复默认", command=self.reset_to_defaults, width=12).pack(side=tk.RIGHT, padx=5)
+    
+    def _update_scroll_region(self):
+        """更新滚动区域"""
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        # 检查是否需要显示滚动条
+        content_height = self.scrollable_frame.winfo_reqheight()
+        canvas_height = self.canvas.winfo_height()
+        if content_height <= canvas_height:
+            self.scrollbar.grid_remove()  # 内容不需要滚动时隐藏滚动条
+        else:
+            self.scrollbar.grid()  # 需要滚动时显示
+    
+    def reset_to_defaults(self):
+        """恢复默认设置"""
+        if not messagebox.askyesno("确认", "确定要恢复所有设置为默认值吗？\n这不会删除您的 API Key 配置。", 
+                                   parent=self.dialog):
+            return
+        
+        # 恢复默认值
+        self.output_mode_var.set('export')
+        self.output_folder_var.set('')
+        self.keep_structure_var.set(True)
+        self.add_tag_var.set(True)
+        self.language_tag_var.set('_zh_CN')
+        self.tag_position_var.set('end')
+        self.bilingual_var.set(False)
+        self.separator_var.set(' | ')
+        self.bilingual_order_var.set('cn_first')
+        self.skip_chinese_var.set(True)
+        self.thread_var.set(4)
+        self.timeout_var.set(30)
+        self.retry_var.set(True)
+        self.retry_count_var.set(3)
+        self.retry_delay_var.set(5)
+        self.generate_report_var.set(True)
+        self.theme_var.set('light')
+        self.save_history_var.set(True)
+        self.max_history_var.set(100)
+        self.display_mode_var.set('简洁模式')
+        
+        messagebox.showinfo("成功", "设置已恢复为默认值", parent=self.dialog)
+
+    def _on_canvas_configure(self, event):
+        """确保内部框架宽度与 Canvas 一致，防止横向滚动"""
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _bind_mousewheel(self, widget):
+        """跨平台滚轮绑定"""
+        widget.bind_all("<MouseWheel>", self._on_mousewheel) # Windows/MacOS
+        widget.bind_all("<Button-4>", self._on_mousewheel)   # Linux
+        widget.bind_all("<Button-5>", self._on_mousewheel)   # Linux
+
+    def _bind_mousewheel_recursive(self, widget):
+        """递归为所有子插件绑定滚轮，防止信号被拦截"""
+        widget.bind("<MouseWheel>", self._on_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_recursive(child)
+
+    def _on_mousewheel(self, event):
+        """处理滚轮逻辑"""
+        # 仅当对话框存在且可见时处理
+        if not self.dialog.winfo_exists(): return
+        
+        if event.num == 4 or event.delta > 0:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or event.delta < 0:
+            self.canvas.yview_scroll(1, "units")
     
     def create_output_tab(self, notebook):
         """创建输出设置选项卡"""
@@ -2135,8 +2437,9 @@ class SettingsDialog(BaseDialog):
         
         ttk.Label(sep_frame, text="分隔符:").pack(side=tk.LEFT)
         self.separator_var = tk.StringVar()
-        ttk.Combobox(sep_frame, textvariable=self.separator_var, 
-                    values=[' | ', ' / ', ' - ', ' · ', ' '], width=8).pack(side=tk.LEFT, padx=8)
+        sep_combo = ttk.Combobox(sep_frame, textvariable=self.separator_var, 
+                    values=[' | ', ' / ', ' - ', ' · ', ' ', ' ⟨ ⟩ ', ' → '], width=10)
+        sep_combo.pack(side=tk.LEFT, padx=8)
         
         order_frame = ttk.Frame(bilingual_frame)
         order_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
@@ -2147,6 +2450,83 @@ class SettingsDialog(BaseDialog):
                        variable=self.bilingual_order_var, value='cn_first').pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(order_frame, text="原文 | 中文", 
                        variable=self.bilingual_order_var, value='en_first').pack(side=tk.LEFT)
+        
+        # 预览框 - 增强的预览效果
+        preview_outer_frame = ttk.Frame(bilingual_frame)
+        preview_outer_frame.pack(fill=tk.X, padx=20, pady=(10, 5))
+        
+        ttk.Label(preview_outer_frame, text="效果预览:", 
+                 font=('Microsoft YaHei UI', 9, 'bold')).pack(anchor=tk.W)
+        
+        # 使用Frame模拟预览框
+        self.preview_frame = ttk.Frame(preview_outer_frame, relief='solid', borderwidth=1)
+        self.preview_frame.pack(fill=tk.X, pady=5)
+        
+        # 预览内容 - 模拟YAML字段显示
+        preview_content = ttk.Frame(self.preview_frame, padding="10")
+        preview_content.pack(fill=tk.X)
+        
+        # 示例字段名
+        ttk.Label(preview_content, text="name:", 
+                 font=('Consolas', 10), foreground='#0066cc').grid(row=0, column=0, sticky='nw')
+        
+        # 预览值标签
+        self.preview_value_label = ttk.Label(preview_content, text="", 
+                                            font=('Microsoft YaHei UI', 10),
+                                            wraplength=350)
+        self.preview_value_label.grid(row=0, column=1, sticky='w', padx=(8, 0))
+        
+        # 添加第二个示例
+        ttk.Label(preview_content, text="description:", 
+                 font=('Consolas', 10), foreground='#0066cc').grid(row=1, column=0, sticky='nw', pady=(5, 0))
+        
+        self.preview_desc_label = ttk.Label(preview_content, text="", 
+                                           font=('Microsoft YaHei UI', 10),
+                                           wraplength=350)
+        self.preview_desc_label.grid(row=1, column=1, sticky='w', padx=(8, 0), pady=(5, 0))
+        
+        # 状态提示
+        self.preview_status_label = ttk.Label(bilingual_frame, text="", 
+                                             foreground='gray', font=('Microsoft YaHei UI', 8, 'italic'))
+        self.preview_status_label.pack(anchor=tk.W, padx=20, pady=(0, 5))
+
+        # 绑定事件以更新预览
+        def update_preview(*args):
+            if not self.bilingual_var.get():
+                self.preview_value_label.config(text="翻译后的中文内容")
+                self.preview_desc_label.config(text="这是一段描述文字的翻译结果")
+                self.preview_status_label.config(text="(双语输出未启用 - 仅显示翻译结果)")
+                self.preview_frame.configure(style='TFrame')
+                return
+            
+            sep = self.separator_var.get()
+            order = self.bilingual_order_var.get()
+            
+            # 示例数据
+            cn_name = "翻译后的中文名称"
+            en_name = "Original English Name"
+            cn_desc = "这是翻译后的描述"
+            en_desc = "Original description text"
+            
+            if order == 'cn_first':
+                name_text = f"{cn_name}{sep}{en_name}"
+                desc_text = f"{cn_desc}{sep}{en_desc}"
+                order_hint = "中文在前"
+            else:
+                name_text = f"{en_name}{sep}{cn_name}"
+                desc_text = f"{en_desc}{sep}{cn_desc}"
+                order_hint = "原文在前"
+            
+            self.preview_value_label.config(text=name_text)
+            self.preview_desc_label.config(text=desc_text)
+            self.preview_status_label.config(text=f"✓ 双语输出已启用 ({order_hint}，分隔符: '{sep.strip()}')")
+
+        self.bilingual_var.trace('w', update_preview)
+        self.separator_var.trace('w', update_preview)
+        self.bilingual_order_var.trace('w', update_preview)
+        
+        # 初始化预览
+        update_preview()
     
     def create_translation_tab(self, notebook):
         """创建翻译设置选项卡"""
@@ -2176,6 +2556,25 @@ class SettingsDialog(BaseDialog):
         self.timeout_var = tk.IntVar()
         ttk.Spinbox(timeout_frame, from_=5, to=300, textvariable=self.timeout_var, width=10).pack(side=tk.LEFT)
         ttk.Label(timeout_frame, text="秒", foreground='gray').pack(side=tk.LEFT, padx=(8, 0))
+        
+        # 批量翻译设置
+        batch_frame = ttk.LabelFrame(trans_tab, text="批量翻译 (可大幅减少API调用)", padding="10")
+        batch_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.batch_enabled_var = tk.BooleanVar()
+        ttk.Checkbutton(batch_frame, text="启用批量翻译（推荐）", 
+                       variable=self.batch_enabled_var).pack(anchor=tk.W, pady=2)
+        
+        batch_size_frame = ttk.Frame(batch_frame)
+        batch_size_frame.pack(fill=tk.X, pady=5, padx=(20, 0))
+        
+        ttk.Label(batch_size_frame, text="每批数量:").pack(side=tk.LEFT, padx=(0, 8))
+        self.batch_size_var = tk.IntVar()
+        ttk.Spinbox(batch_size_frame, from_=2, to=50, textvariable=self.batch_size_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(batch_size_frame, text="条/批 (建议5-15)", foreground='gray').pack(side=tk.LEFT, padx=(8, 0))
+        
+        ttk.Label(batch_frame, text="💡 批量翻译将多条文本合并为一次API调用，可减少70-80%的调用次数",
+                 foreground='#666', font=('Microsoft YaHei UI', 8), wraplength=400).pack(anchor=tk.W, pady=(5, 0), padx=(20, 0))
         
         # 失败重试
         retry_frame = ttk.LabelFrame(trans_tab, text="失败重试", padding="10")
@@ -2265,7 +2664,6 @@ class SettingsDialog(BaseDialog):
         """加载设置"""
         config = self.config_manager.config
         
-        # 输出设置
         self.output_mode_var.set(config.get('output_mode', 'export'))
         self.output_folder_var.set(config.get('output_folder', ''))
         self.keep_structure_var.set(config.get('keep_structure', True))
@@ -2273,7 +2671,6 @@ class SettingsDialog(BaseDialog):
         self.language_tag_var.set(config.get('language_tag', '_zh_CN'))
         self.tag_position_var.set(config.get('tag_position', 'end'))
         
-        # 设置标签下拉框
         tag_values = []
         for preset in config.get('preset_tags', []):
             tag_values.append(preset['tag'])
@@ -2283,16 +2680,19 @@ class SettingsDialog(BaseDialog):
         self.separator_var.set(config.get('bilingual_separator', ' | '))
         self.bilingual_order_var.set(config.get('bilingual_order', 'cn_first'))
         
-        # 翻译设置
         self.skip_chinese_var.set(config.get('skip_chinese', True))
         self.thread_var.set(config.get('max_threads', 4))
         self.timeout_var.set(config.get('api_timeout', 30))
+        
+        # 批量翻译设置
+        self.batch_enabled_var.set(config.get('enable_batch_translation', True))
+        self.batch_size_var.set(config.get('batch_size', 10))
+        
         self.retry_var.set(config.get('enable_retry', True))
         self.retry_count_var.set(config.get('max_retries', 3))
         self.retry_delay_var.set(config.get('retry_delay', 5))
         self.generate_report_var.set(config.get('generate_report', True))
         
-        # 界面设置
         self.theme_var.set(config.get('theme', 'light'))
         self.save_history_var.set(config.get('save_history', True))
         self.max_history_var.set(config.get('max_history', 100))
@@ -2305,7 +2705,6 @@ class SettingsDialog(BaseDialog):
         """保存设置"""
         config = self.config_manager.config
         
-        # 输出设置
         config['output_mode'] = self.output_mode_var.get()
         config['output_folder'] = self.output_folder_var.get()
         config['keep_structure'] = self.keep_structure_var.get()
@@ -2316,16 +2715,19 @@ class SettingsDialog(BaseDialog):
         config['bilingual_separator'] = self.separator_var.get()
         config['bilingual_order'] = self.bilingual_order_var.get()
         
-        # 翻译设置
         config['skip_chinese'] = self.skip_chinese_var.get()
         config['max_threads'] = self.thread_var.get()
         config['api_timeout'] = self.timeout_var.get()
+        
+        # 批量翻译设置
+        config['enable_batch_translation'] = self.batch_enabled_var.get()
+        config['batch_size'] = self.batch_size_var.get()
+        
         config['enable_retry'] = self.retry_var.get()
         config['max_retries'] = self.retry_count_var.get()
         config['retry_delay'] = self.retry_delay_var.get()
         config['generate_report'] = self.generate_report_var.get()
         
-        # 界面设置
         config['theme'] = self.theme_var.get()
         config['save_history'] = self.save_history_var.get()
         config['max_history'] = self.max_history_var.get()
@@ -2340,6 +2742,424 @@ class SettingsDialog(BaseDialog):
         
         messagebox.showinfo("成功", "设置已保存", parent=self.dialog)
         self.destroy()
+
+
+# ==================== 翻译预览对话框 ====================
+
+class TranslationPreviewDialog(BaseDialog):
+    """翻译前预览对话框 - 显示待翻译内容的统计信息"""
+    
+    def __init__(self, parent: tk.Tk, file_paths: List[str], config_manager: ConfigManager,
+                 on_confirm: Callable = None):
+        super().__init__(parent, "翻译预览", 700, 550)
+        self.file_paths = file_paths
+        self.config_manager = config_manager
+        self.on_confirm = on_confirm
+        self.preview_data = None
+        self.analyzing = False
+        
+        self.setup_ui()
+        self.center_window()
+        
+        # 开始分析
+        self.start_analysis()
+    
+    def setup_ui(self):
+        """设置UI"""
+        self.dialog.rowconfigure(1, weight=1)
+        self.dialog.columnconfigure(0, weight=1)
+        
+        # 标题
+        title_frame = ttk.Frame(self.dialog, padding="15 15 15 10")
+        title_frame.grid(row=0, column=0, sticky='ew')
+        
+        ttk.Label(title_frame, text="📊 翻译任务预览", 
+                 font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor=tk.W)
+        ttk.Label(title_frame, text="分析待翻译文件，预览翻译任务详情", 
+                 font=('Microsoft YaHei UI', 9), foreground='gray').pack(anchor=tk.W)
+        
+        # 内容区域
+        content_frame = ttk.Frame(self.dialog, padding="15")
+        content_frame.grid(row=1, column=0, sticky='nsew')
+        content_frame.rowconfigure(1, weight=1)
+        content_frame.columnconfigure(0, weight=1)
+        
+        # 统计信息框
+        stats_frame = ttk.LabelFrame(content_frame, text="统计信息", padding="10")
+        stats_frame.grid(row=0, column=0, sticky='ew', pady=(0, 10))
+        stats_frame.columnconfigure(1, weight=1)
+        stats_frame.columnconfigure(3, weight=1)
+        
+        # 统计标签
+        self.stats_labels = {}
+        stats_items = [
+            ('files', '文件数量:', 0, 0),
+            ('fields', '待翻译字段:', 0, 1),
+            ('skip', '将跳过:', 2, 0),
+            ('chars', '总字符数:', 2, 1),
+        ]
+        
+        for key, label, row, col in stats_items:
+            ttk.Label(stats_frame, text=label).grid(row=row, column=col*2, sticky='w', padx=5, pady=3)
+            self.stats_labels[key] = ttk.Label(stats_frame, text="分析中...", 
+                                               font=('Microsoft YaHei UI', 9, 'bold'))
+            self.stats_labels[key].grid(row=row, column=col*2+1, sticky='w', padx=(0, 20), pady=3)
+        
+        # 估算信息
+        estimate_frame = ttk.LabelFrame(content_frame, text="预估信息", padding="10")
+        estimate_frame.grid(row=1, column=0, sticky='nsew', pady=(0, 10))
+        estimate_frame.columnconfigure(0, weight=1)
+        
+        self.estimate_text = tk.Text(estimate_frame, height=6, font=('Microsoft YaHei UI', 9),
+                                     wrap=tk.WORD, state='disabled')
+        self.estimate_text.pack(fill=tk.BOTH, expand=True)
+        
+        # 字段详情
+        detail_frame = ttk.LabelFrame(content_frame, text="字段详情 (前50条)", padding="10")
+        detail_frame.grid(row=2, column=0, sticky='nsew')
+        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        
+        # Treeview 显示字段
+        columns = ('file', 'field', 'value')
+        self.detail_tree = ttk.Treeview(detail_frame, columns=columns, show='headings', height=8)
+        self.detail_tree.heading('file', text='文件')
+        self.detail_tree.heading('field', text='字段')
+        self.detail_tree.heading('value', text='内容预览')
+        
+        self.detail_tree.column('file', width=150)
+        self.detail_tree.column('field', width=100)
+        self.detail_tree.column('value', width=300)
+        
+        scrollbar = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=self.detail_tree.yview)
+        self.detail_tree.configure(yscroll=scrollbar.set)
+        
+        self.detail_tree.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        
+        # 进度条
+        self.progress_frame = ttk.Frame(content_frame)
+        self.progress_frame.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode='indeterminate')
+        self.progress_bar.pack(fill=tk.X)
+        self.progress_label = ttk.Label(self.progress_frame, text="正在分析文件...")
+        self.progress_label.pack(pady=(5, 0))
+        
+        # 底部按钮
+        btn_frame = ttk.Frame(self.dialog, padding="15")
+        btn_frame.grid(row=2, column=0, sticky='ew')
+        
+        self.confirm_btn = ttk.Button(btn_frame, text="开始翻译", 
+                                      command=self.on_confirm_click, 
+                                      state=tk.DISABLED, width=15,
+                                      style='Accent.TButton')
+        self.confirm_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="取消", command=self.destroy, width=12).pack(side=tk.LEFT, padx=5)
+        
+        # 批量翻译提示
+        batch_enabled = self.config_manager.config.get('enable_batch_translation', True)
+        batch_size = self.config_manager.config.get('batch_size', 10)
+        if batch_enabled:
+            ttk.Label(btn_frame, text=f"✓ 批量翻译已启用 (每批{batch_size}条)", 
+                     foreground='green', font=('Microsoft YaHei UI', 8)).pack(side=tk.RIGHT, padx=5)
+    
+    def start_analysis(self):
+        """开始分析文件"""
+        self.analyzing = True
+        self.progress_bar.start()
+        
+        def analyze():
+            try:
+                result = self._analyze_files()
+                self.dialog.after(0, lambda: self.on_analysis_complete(result))
+            except Exception as e:
+                self.dialog.after(0, lambda: self.on_analysis_error(str(e)))
+        
+        thread = threading.Thread(target=analyze, daemon=True)
+        thread.start()
+    
+    def _analyze_files(self) -> Dict[str, Any]:
+        """分析文件内容"""
+        translation_config = self.config_manager.get_translation_config()
+        field_extractor = FieldExtractor(translation_config.field_rules)
+        
+        result = {
+            'total_files': len(self.file_paths),
+            'total_fields': 0,
+            'skip_fields': 0,
+            'total_chars': 0,
+            'fields_detail': [],
+            'files_detail': {}
+        }
+        
+        for file_path in self.file_paths:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = yaml.load(f, Loader=CustomYAMLLoader)
+                
+                if data is None:
+                    continue
+                
+                fields = field_extractor.extract_fields(data)
+                file_name = os.path.basename(file_path)
+                
+                file_fields = 0
+                file_skip = 0
+                
+                for field_info in fields:
+                    value = field_info['value']
+                    
+                    # 检查是否包含中文
+                    has_chinese = any('\u4e00' <= char <= '\u9fff' for char in str(value))
+                    
+                    if translation_config.skip_chinese and has_chinese:
+                        file_skip += 1
+                        result['skip_fields'] += 1
+                    else:
+                        file_fields += 1
+                        result['total_fields'] += 1
+                        result['total_chars'] += len(value)
+                        
+                        # 只保存前50条详情
+                        if len(result['fields_detail']) < 50:
+                            result['fields_detail'].append({
+                                'file': file_name,
+                                'field': field_info['field_name'],
+                                'path': field_info['path'],
+                                'value': value[:100] + '...' if len(value) > 100 else value
+                            })
+                
+                result['files_detail'][file_name] = {
+                    'fields': file_fields,
+                    'skip': file_skip
+                }
+                
+            except Exception as e:
+                result['files_detail'][os.path.basename(file_path)] = {'error': str(e)}
+        
+        return result
+    
+    def on_analysis_complete(self, result: Dict[str, Any]):
+        """分析完成"""
+        self.analyzing = False
+        self.preview_data = result
+        self.progress_bar.stop()
+        self.progress_frame.grid_remove()
+        
+        # 更新统计信息
+        self.stats_labels['files'].config(text=str(result['total_files']))
+        self.stats_labels['fields'].config(text=str(result['total_fields']))
+        self.stats_labels['skip'].config(text=str(result['skip_fields']))
+        self.stats_labels['chars'].config(text=f"{result['total_chars']:,}")
+        
+        # 更新估算信息
+        self.estimate_text.config(state='normal')
+        self.estimate_text.delete('1.0', tk.END)
+        
+        batch_enabled = self.config_manager.config.get('enable_batch_translation', True)
+        batch_size = self.config_manager.config.get('batch_size', 10)
+        
+        if batch_enabled:
+            api_calls = (result['total_fields'] + batch_size - 1) // batch_size
+            estimate = f"""📈 预估信息:
+• 预计 API 调用次数: 约 {api_calls} 次 (批量模式，每批 {batch_size} 条)
+• 待翻译字符数: {result['total_chars']:,} 字符
+• 按每 1000 tokens ≈ 750 字符估算，约消耗 {result['total_chars'] * 2 // 750:,} tokens
+
+💡 提示:
+• 批量翻译模式已启用，可大幅减少 API 调用次数
+• 已包含中文的字段将被跳过 ({result['skip_fields']} 个)
+• 实际费用取决于所选 API 平台的定价"""
+        else:
+            estimate = f"""📈 预估信息:
+• 预计 API 调用次数: 约 {result['total_fields']} 次 (单条模式)
+• 待翻译字符数: {result['total_chars']:,} 字符
+• 按每 1000 tokens ≈ 750 字符估算，约消耗 {result['total_chars'] * 2 // 750:,} tokens
+
+💡 提示:
+• 建议开启批量翻译模式以减少 API 调用次数
+• 已包含中文的字段将被跳过 ({result['skip_fields']} 个)"""
+        
+        self.estimate_text.insert('1.0', estimate)
+        self.estimate_text.config(state='disabled')
+        
+        # 填充字段详情
+        for item in result['fields_detail']:
+            self.detail_tree.insert('', tk.END, values=(
+                item['file'],
+                item['field'],
+                item['value']
+            ))
+        
+        # 启用确认按钮
+        if result['total_fields'] > 0:
+            self.confirm_btn.config(state=tk.NORMAL)
+        else:
+            self.confirm_btn.config(state=tk.DISABLED)
+            messagebox.showinfo("提示", "未找到需要翻译的字段", parent=self.dialog)
+    
+    def on_analysis_error(self, error: str):
+        """分析出错"""
+        self.analyzing = False
+        self.progress_bar.stop()
+        self.progress_label.config(text=f"分析出错: {error}")
+        messagebox.showerror("错误", f"分析文件时出错:\n{error}", parent=self.dialog)
+    
+    def on_confirm_click(self):
+        """确认开始翻译"""
+        if self.on_confirm:
+            self.on_confirm()
+        self.destroy()
+
+
+# ==================== 翻译完成对话框 ====================
+
+class TranslationCompleteDialog(BaseDialog):
+    """翻译完成后显示的对话框，提供打开输出文件/文件夹的选项"""
+    
+    def __init__(self, parent: tk.Tk, stats: Dict[str, Any], output_folder: str, 
+                 output_files: List[str] = None, report_file: str = None):
+        super().__init__(parent, "翻译完成", 500, 380)
+        self.stats = stats
+        self.output_folder = output_folder
+        self.output_files = output_files or []
+        self.report_file = report_file
+        
+        self.setup_ui()
+        self.center_window()
+    
+    def setup_ui(self):
+        """设置UI"""
+        self.dialog.rowconfigure(1, weight=1)
+        self.dialog.columnconfigure(0, weight=1)
+        
+        # 标题
+        title_frame = ttk.Frame(self.dialog, padding="20 20 20 10")
+        title_frame.grid(row=0, column=0, sticky='ew')
+        
+        ttk.Label(title_frame, text="✓ 翻译任务完成！", 
+                 font=('Microsoft YaHei UI', 14, 'bold'),
+                 foreground='#2e7d32').pack(anchor=tk.W)
+        
+        # 统计信息
+        stats_frame = ttk.LabelFrame(self.dialog, text="翻译统计", padding="15")
+        stats_frame.grid(row=1, column=0, sticky='nsew', padx=20, pady=10)
+        
+        stats_data = [
+            ("处理文件", f"{self.stats.get('processed_files', 0)}/{self.stats.get('total_files', 0)}"),
+            ("翻译成功", str(self.stats.get('successful_translations', 0))),
+            ("跳过项", str(self.stats.get('skipped_translations', 0))),
+            ("失败项", str(self.stats.get('failed_translations', 0))),
+            ("总耗时", f"{self.stats.get('duration', 0):.2f} 秒"),
+        ]
+        
+        for i, (label, value) in enumerate(stats_data):
+            ttk.Label(stats_frame, text=f"{label}:", font=('Microsoft YaHei UI', 9)).grid(
+                row=i, column=0, sticky='w', pady=2)
+            
+            # 失败项用红色标记
+            fg = '#dc143c' if label == "失败项" and int(self.stats.get('failed_translations', 0)) > 0 else None
+            lbl = ttk.Label(stats_frame, text=value, font=('Microsoft YaHei UI', 9, 'bold'))
+            if fg:
+                lbl.configure(foreground=fg)
+            lbl.grid(row=i, column=1, sticky='w', padx=(10, 0), pady=2)
+        
+        # 操作按钮区域
+        btn_frame = ttk.Frame(self.dialog, padding="15")
+        btn_frame.grid(row=2, column=0, sticky='ew')
+        
+        # 打开输出文件夹按钮
+        open_folder_btn = ttk.Button(btn_frame, text="📂 打开输出文件夹", 
+                                     command=self.open_output_folder, width=18)
+        open_folder_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 打开最近输出文件按钮（如果有输出文件）
+        if self.output_files:
+            open_file_btn = ttk.Button(btn_frame, text="📄 打开输出文件", 
+                                       command=self.open_output_file, width=18)
+            open_file_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 打开报告按钮（如果生成了报告）
+        if self.report_file and os.path.exists(self.report_file):
+            report_btn = ttk.Button(btn_frame, text="📊 查看报告", 
+                                   command=self.open_report, width=12)
+            report_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 关闭按钮
+        ttk.Button(btn_frame, text="关闭", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=5)
+    
+    def open_output_folder(self):
+        """打开输出文件夹"""
+        if self.output_folder and os.path.exists(self.output_folder):
+            open_path_in_os(self.output_folder)
+        else:
+            messagebox.showwarning("警告", "输出文件夹不存在", parent=self.dialog)
+    
+    def open_output_file(self):
+        """打开输出文件（弹出选择菜单如果有多个文件）"""
+        if not self.output_files:
+            messagebox.showwarning("警告", "没有输出文件", parent=self.dialog)
+            return
+        
+        if len(self.output_files) == 1:
+            # 只有一个文件，直接打开
+            if os.path.exists(self.output_files[0]):
+                open_path_in_os(self.output_files[0])
+        else:
+            # 多个文件，创建选择对话框
+            self.show_file_selector()
+    
+    def show_file_selector(self):
+        """显示文件选择器"""
+        selector = tk.Toplevel(self.dialog)
+        selector.title("选择要打开的文件")
+        selector.geometry("400x300")
+        selector.transient(self.dialog)
+        selector.grab_set()
+        
+        ttk.Label(selector, text="选择要打开的输出文件:", 
+                 padding="10").pack(anchor=tk.W)
+        
+        # 文件列表
+        list_frame = ttk.Frame(selector)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, 
+                                  font=('Microsoft YaHei UI', 9))
+        file_listbox.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=file_listbox.yview)
+        
+        for f in self.output_files[:50]:  # 最多显示50个
+            file_listbox.insert(tk.END, os.path.basename(f))
+        
+        def open_selected():
+            selection = file_listbox.curselection()
+            if selection:
+                idx = selection[0]
+                if idx < len(self.output_files):
+                    path = self.output_files[idx]
+                    if os.path.exists(path):
+                        open_path_in_os(path)
+                        selector.destroy()
+        
+        btn_frame = ttk.Frame(selector, padding="10")
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="打开", command=open_selected, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=selector.destroy, width=12).pack(side=tk.LEFT)
+        
+        file_listbox.bind('<Double-1>', lambda e: open_selected())
+    
+    def open_report(self):
+        """打开翻译报告"""
+        if self.report_file and os.path.exists(self.report_file):
+            webbrowser.open(self.report_file)
+
 
 # ==================== 历史记录对话框 ====================
 
@@ -2359,7 +3179,6 @@ class HistoryDialog(BaseDialog):
         self.dialog.rowconfigure(1, weight=1)
         self.dialog.columnconfigure(0, weight=1)
         
-        # 标题
         title_frame = ttk.Frame(self.dialog, padding="15 15 15 5")
         title_frame.grid(row=0, column=0, sticky='ew')
         
@@ -2372,7 +3191,6 @@ class HistoryDialog(BaseDialog):
                  font=('Microsoft YaHei UI', 8),
                  foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
         
-        # 列表
         list_frame = ttk.Frame(self.dialog, padding="0 0 15 10")
         list_frame.grid(row=1, column=0, sticky='nsew', padx=15)
         list_frame.rowconfigure(0, weight=1)
@@ -2400,7 +3218,6 @@ class HistoryDialog(BaseDialog):
         self.tree.grid(row=0, column=0, sticky='nsew')
         scrollbar.grid(row=0, column=1, sticky='ns')
         
-        # 按钮
         btn_frame = ttk.Frame(self.dialog, padding="15")
         btn_frame.grid(row=2, column=0, sticky='ew')
         
@@ -2430,10 +3247,11 @@ class HistoryDialog(BaseDialog):
             self.tree.delete(*self.tree.get_children())
             messagebox.showinfo("成功", "历史记录已清除", parent=self.dialog)
 
-# ==================== 主GUI类（精简版）====================
+
+# ==================== 主GUI类 (增强版) ====================
 
 class TranslatorGUI:
-    """主GUI类 - 重构精简版"""
+    """主GUI类"""
     
     def __init__(self, root):
         self.root = root
@@ -2444,8 +3262,13 @@ class TranslatorGUI:
         self.config_manager = ConfigManager()
         self.translator_core = None
         self.is_translating = False
+        self.translation_lock = threading.Lock()
         self.file_queue = []
         self.current_base_folder = None
+        self.last_output_folder = None
+        self.last_output_files = []  # 保存最近输出的文件列表
+        self.last_report_file = None  # 保存最近的报告文件路径
+        self.last_stats = None  # 保存最近的统计信息
         
         self.setup_styles()
         self.create_ui()
@@ -2483,23 +3306,23 @@ class TranslatorGUI:
         menubar = Menu(self.root)
         self.root.config(menu=menubar)
         
-        # 文件菜单
         file_menu = Menu(menubar, tearoff=0)
         menubar.add_cascade(label="文件(F)", menu=file_menu)
         file_menu.add_command(label="添加文件", command=self.add_files, accelerator="Ctrl+O")
         file_menu.add_command(label="添加文件夹", command=self.add_folder, accelerator="Ctrl+D")
         file_menu.add_command(label="清空列表", command=self.clear_files)
         file_menu.add_separator()
+        file_menu.add_command(label="导入配置...", command=self.import_config)
+        file_menu.add_command(label="导出配置...", command=self.export_config)
+        file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_closing)
         
-        # 工具菜单
         tools_menu = Menu(menubar, tearoff=0)
         menubar.add_cascade(label="工具(T)", menu=tools_menu)
         tools_menu.add_command(label="管理 API Key", command=self.show_key_manager)
         tools_menu.add_command(label="字段配置", command=self.show_field_config)
         tools_menu.add_command(label="设置...", command=self.show_settings, accelerator="Ctrl+,")
         
-        # 帮助菜单
         help_menu = Menu(menubar, tearoff=0)
         menubar.add_cascade(label="帮助(H)", menu=help_menu)
         help_menu.add_command(label="翻译历史记录", command=self.show_history)
@@ -2557,52 +3380,116 @@ class TranslatorGUI:
         main_container.columnconfigure(0, weight=1)
         main_container.columnconfigure(1, weight=1)
         
-        # 左侧文件列表
         self.create_file_list_panel(main_container)
-        
-        # 右侧日志和进度
         self.create_log_panel(main_container)
     
     def create_file_list_panel(self, parent):
-        """创建文件列表面板"""
+        """创建文件列表面板 (整合 1.30 显示模式与排序)"""
         left_panel = ttk.LabelFrame(parent, text=" 待翻译文件 ", padding="8")
         left_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
-        left_panel.rowconfigure(1, weight=1)
+        left_panel.rowconfigure(3, weight=1)  # 让列表区域占满剩余空间
         left_panel.columnconfigure(0, weight=1)
+
+        # --- 搜索栏 ---
+        search_frame = ttk.Frame(left_panel)
+        search_frame.grid(row=0, column=0, sticky='ew', pady=(0, 5))
         
-        # 文件列表
+        ttk.Label(search_frame, text="🔍").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', lambda *args: self.on_search_changed())
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=20)
+        self.search_entry.pack(side=tk.LEFT, padx=(5, 5), fill=tk.X, expand=True)
+        
+        # 清除搜索按钮
+        self.clear_search_btn = ttk.Button(search_frame, text="✕", width=3, 
+                                           command=self.clear_search)
+        self.clear_search_btn.pack(side=tk.LEFT)
+        
+        # 搜索结果标签
+        self.search_result_label = ttk.Label(search_frame, text="", foreground='gray',
+                                             font=('Microsoft YaHei UI', 8))
+        self.search_result_label.pack(side=tk.LEFT, padx=(5, 0))
+
+        # --- 控制栏：查看模式与排序 ---
+        ctrl_bar = ttk.Frame(left_panel)
+        ctrl_bar.grid(row=1, column=0, sticky='ew', pady=(0, 5))
+        
+        # 模式选择
+        ttk.Label(ctrl_bar, text="模式:").pack(side=tk.LEFT)
+        self.view_mode_combo = ttk.Combobox(ctrl_bar, width=8, state='readonly', 
+                                           values=['简洁', '详细', '超详细'])
+        self.view_mode_combo.set('简洁')
+        self.view_mode_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_file_list())
+        self.view_mode_combo.pack(side=tk.LEFT, padx=(2, 8))
+
+        # 排序选择
+        ttk.Label(ctrl_bar, text="排序:").pack(side=tk.LEFT)
+        self.sort_mode_combo = ttk.Combobox(ctrl_bar, width=10, state='readonly',
+                                           values=['添加顺序', '名称 A-Z', '大小', '修改时间'])
+        self.sort_mode_combo.set('添加顺序')
+        self.sort_mode_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_file_list())
+        self.sort_mode_combo.pack(side=tk.LEFT, padx=2)
+
+        # 列表容器 (带滚动条)
         list_container = ttk.Frame(left_panel)
-        list_container.grid(row=1, column=0, sticky='nsew', pady=(0, 8))
+        list_container.grid(row=3, column=0, sticky='nsew', pady=(0, 8))
         list_container.rowconfigure(0, weight=1)
         list_container.columnconfigure(0, weight=1)
+        
+        # 保存原始文件队列用于搜索过滤
+        self._filtered_indices = None  # None 表示未过滤
         
         scrollbar = ttk.Scrollbar(list_container)
         scrollbar.grid(row=0, column=1, sticky='ns')
         
+        # selectmode=tk.EXTENDED 支持 Shift 和 Ctrl 多选
         self.file_listbox = tk.Listbox(
-            list_container,
-            yscrollcommand=scrollbar.set,
-            selectmode=tk.EXTENDED,
-            font=('Microsoft YaHei UI', 9)
+            list_container, yscrollcommand=scrollbar.set,
+            selectmode=tk.EXTENDED, font=('Microsoft YaHei UI', 9),
+            relief=tk.FLAT, highlightthickness=1
         )
         self.file_listbox.grid(row=0, column=0, sticky='nsew')
         scrollbar.config(command=self.file_listbox.yview)
         
+        # --- [增强] 右键上下文菜单 ---
+        self.file_context_menu = Menu(self.root, tearoff=0)
+        # 菜单项将在显示时动态更新
+        self.file_context_menu.add_command(label="打开文件", command=self.open_selected_files)
+        self.file_context_menu.add_command(label="用编辑器打开", command=self.open_with_editor)
+        self.file_context_menu.add_command(label="打开所在文件夹", command=self.open_selected_folder)
+        self.file_context_menu.add_separator()
+        self.file_context_menu.add_command(label="复制文件路径", command=self.copy_file_path)
+        self.file_context_menu.add_command(label="复制文件名", command=self.copy_file_name)
+        self.file_context_menu.add_separator()
+        self.file_context_menu.add_command(label="从列表移除", command=self.remove_selected_files)
+        self.file_context_menu.add_command(label="仅保留选中项", command=self.keep_only_selected)
+        self.file_context_menu.add_separator()
+        self.file_context_menu.add_command(label="全选", command=self.select_all_files)
+        
+        # 绑定右键事件 (兼容多平台)
+        right_click_btn = '<Button-2>' if platform.system() == 'Darwin' else '<Button-3>'
+        self.file_listbox.bind(right_click_btn, self.on_listbox_right_click)
+        
+        # 绑定Delete键删除选中项
+        self.file_listbox.bind('<Delete>', lambda e: self.remove_selected_files())
+        
+        # 拖拽支持 (如果环境支持)
         if HAS_DND:
-            self.file_listbox.drop_target_register(DND_FILES)
-            self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
+            try:
+                self.file_listbox.drop_target_register(DND_FILES)
+                self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
+            except: pass
         
-        # 按钮
+        # 底部操作按钮
         btn_frame = ttk.Frame(left_panel)
-        btn_frame.grid(row=2, column=0, sticky='ew')
-        
+        btn_frame.grid(row=4, column=0, sticky='ew')
         ttk.Button(btn_frame, text="添加文件", command=self.add_files).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
         ttk.Button(btn_frame, text="添加文件夹", command=self.add_folder).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
-        ttk.Button(btn_frame, text="清空", command=self.clear_files).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        ttk.Button(btn_frame, text="清空列表", command=self.clear_files).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
         
-        self.file_count_label = ttk.Label(left_panel, text="已选择: 0 个文件",
-                                         font=('Microsoft YaHei UI', 9, 'bold'))
-        self.file_count_label.grid(row=3, column=0, sticky='w', pady=(8, 0))
+        # 统计标签
+        self.file_count_label = ttk.Label(left_panel, text="已选择: 0 个文件", font=('Microsoft YaHei UI', 9, 'bold'))
+        self.file_count_label.grid(row=5, column=0, sticky='w', pady=(8, 0))
     
     def create_log_panel(self, parent):
         """创建日志面板"""
@@ -2611,7 +3498,6 @@ class TranslatorGUI:
         right_panel.rowconfigure(1, weight=1)
         right_panel.columnconfigure(0, weight=1)
         
-        # 进度
         progress_frame = ttk.LabelFrame(right_panel, text=" 翻译进度 ", padding="8")
         progress_frame.grid(row=0, column=0, sticky='ew', pady=(0, 8))
         progress_frame.columnconfigure(0, weight=1)
@@ -2622,7 +3508,6 @@ class TranslatorGUI:
         self.progress_label = ttk.Label(progress_frame, text="就绪")
         self.progress_label.grid(row=1, column=0, sticky='w')
         
-        # 日志
         log_frame = ttk.LabelFrame(right_panel, text=" 运行日志 ", padding="8")
         log_frame.grid(row=1, column=0, sticky='nsew')
         log_frame.rowconfigure(0, weight=1)
@@ -2665,44 +3550,764 @@ class TranslatorGUI:
         )
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(bottom_frame, text="字段配置", command=self.show_field_config, width=12).pack(side=tk.LEFT, padx=5)
+        self.open_output_btn = ttk.Button(
+            bottom_frame,
+            text="打开输出目录",
+            command=self.open_output_folder,
+            state=tk.DISABLED,
+            width=15
+        )
+        self.open_output_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Separator(bottom_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        
+        ttk.Button(bottom_frame, text="输出设置", command=lambda: self.show_settings(tab=0), 
+                  width=12).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(bottom_frame, text="字段配置", command=self.show_field_config, 
+                  width=12).pack(side=tk.LEFT, padx=5)
     
     # ==================== 事件处理 ====================
     
-    def on_key_selected(self, event):
+    def on_listbox_right_click(self, event):
+        """右键点击列表"""
+        try:
+            # 如果点击在选中项之外，则选中当前点击项（单选）
+            # 如果点击在已选中的多选范围内，则保持选择状态
+            index = self.file_listbox.nearest(event.y)
+            if index not in self.file_listbox.curselection():
+                self.file_listbox.selection_clear(0, tk.END)
+                self.file_listbox.selection_set(index)
+                self.file_listbox.activate(index)
+            
+            selection = self.file_listbox.curselection()
+            if selection:
+                # 动态更新菜单标签以显示选中数量
+                count = len(selection)
+                if count == 1:
+                    self.file_context_menu.entryconfigure(0, label="打开文件")
+                    self.file_context_menu.entryconfigure(6, label="从列表移除")
+                else:
+                    self.file_context_menu.entryconfigure(0, label=f"打开 {count} 个文件")
+                    self.file_context_menu.entryconfigure(6, label=f"从列表移除 ({count} 项)")
+                
+                self.file_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.file_context_menu.grab_release()
+
+    def _get_real_index(self, listbox_index: int) -> int:
+        """将列表框索引转换为文件队列的实际索引"""
+        if self._filtered_indices is not None and listbox_index < len(self._filtered_indices):
+            return self._filtered_indices[listbox_index]
+        return listbox_index
+    
+    def remove_selected_files(self):
+        """移除选中的文件"""
+        selection = list(self.file_listbox.curselection())
+        
+        # 转换为实际索引
+        real_indices = [self._get_real_index(i) for i in selection]
+        real_indices.sort(reverse=True)  # 从后往前删，避免索引偏移
+        
+        for idx in real_indices:
+            if idx < len(self.file_queue):
+                del self.file_queue[idx]
+        
+        # 刷新列表
+        self.refresh_file_list()
+        self.update_file_count()
+    
+    def open_selected_files(self):
+        """打开选中的文件"""
+        selection = self.file_listbox.curselection()
+        for index in selection:
+            real_idx = self._get_real_index(index)
+            if real_idx < len(self.file_queue):
+                path = self.file_queue[real_idx]
+                if os.path.exists(path):
+                    open_path_in_os(path)
+    
+    def open_selected_folder(self):
+        """打开选中文件的文件夹"""
+        selection = self.file_listbox.curselection()
+        if selection:
+            real_idx = self._get_real_index(selection[0])
+            if real_idx < len(self.file_queue):
+                path = self.file_queue[real_idx]
+                folder = os.path.dirname(path)
+                if os.path.exists(folder):
+                    open_path_in_os(folder)
+
+    def open_with_editor(self):
+        """用系统默认编辑器打开选中的文件"""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        
+        # 只打开前几个文件，避免一次性打开太多
+        max_open = 5
+        opened = 0
+        for index in selection:
+            if opened >= max_open:
+                remaining = len(selection) - opened
+                if remaining > 0:
+                    self.log_message(f"[INFO] 已打开 {max_open} 个文件，剩余 {remaining} 个未打开")
+                break
+            real_idx = self._get_real_index(index)
+            if real_idx < len(self.file_queue):
+                path = self.file_queue[real_idx]
+                if os.path.exists(path):
+                    try:
+                        if platform.system() == 'Windows':
+                            os.startfile(path, 'edit')
+                        elif platform.system() == 'Darwin':
+                            subprocess.call(['open', '-e', path])
+                        else:
+                            editors = ['xdg-open', 'gedit', 'kate', 'nano', 'vim']
+                            for editor in editors:
+                                try:
+                                    subprocess.Popen([editor, path])
+                                    break
+                                except FileNotFoundError:
+                                    continue
+                        opened += 1
+                    except Exception as e:
+                        self.log_message(f"[WARNING] 无法用编辑器打开 {os.path.basename(path)}: {e}")
+
+    def copy_file_path(self):
+        """复制选中文件的路径到剪贴板"""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        
+        paths = []
+        for index in selection:
+            real_idx = self._get_real_index(index)
+            if real_idx < len(self.file_queue):
+                paths.append(self.file_queue[real_idx])
+        
+        if paths:
+            text = '\n'.join(paths)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            
+            count = len(paths)
+            if count == 1:
+                self.log_message(f"[INFO] 已复制文件路径到剪贴板")
+            else:
+                self.log_message(f"[INFO] 已复制 {count} 个文件路径到剪贴板")
+
+    def copy_file_name(self):
+        """复制选中文件的名称到剪贴板"""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        
+        names = []
+        for index in selection:
+            real_idx = self._get_real_index(index)
+            if real_idx < len(self.file_queue):
+                names.append(os.path.basename(self.file_queue[real_idx]))
+        
+        if names:
+            text = '\n'.join(names)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            
+            count = len(names)
+            if count == 1:
+                self.log_message(f"[INFO] 已复制文件名到剪贴板")
+            else:
+                self.log_message(f"[INFO] 已复制 {count} 个文件名到剪贴板")
+
+    def keep_only_selected(self):
+        """仅保留选中的文件，移除其他所有文件"""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        
+        # 获取选中的文件（转换为实际索引）
+        selected_files = []
+        for i in selection:
+            real_idx = self._get_real_index(i)
+            if real_idx < len(self.file_queue):
+                selected_files.append(self.file_queue[real_idx])
+        
+        if not selected_files:
+            return
+        
+        # 确认操作
+        remove_count = len(self.file_queue) - len(selected_files)
+        if remove_count > 0:
+            if not messagebox.askyesno("确认", 
+                                       f"确定要移除其他 {remove_count} 个文件，仅保留选中的 {len(selected_files)} 个文件吗？"):
+                return
+        
+        # 更新文件队列并清除搜索
+        self.file_queue = selected_files
+        if hasattr(self, 'search_var'):
+            self.search_var.set('')
+        self.refresh_file_list()
+        self.update_file_count()
+
+    def select_all_files(self):
+        """全选所有文件"""
+        if self.file_queue:
+            self.file_listbox.selection_set(0, tk.END)
+
+    def on_search_changed(self):
+        """搜索框内容变化时触发"""
+        self.refresh_file_list()
+    
+    def clear_search(self):
+        """清除搜索"""
+        self.search_var.set('')
+        self.search_entry.focus_set()
+    
+    def refresh_file_list(self):
+        """刷新文件列表显示（根据当前显示模式、排序模式和搜索过滤）"""
+        # 保存当前选中状态
+        selection = list(self.file_listbox.curselection())
+        
+        # 获取排序模式
+        sort_mode = self.sort_mode_combo.get() if hasattr(self, 'sort_mode_combo') else '添加顺序'
+        
+        # 对文件队列进行排序
+        if sort_mode == '名称 A-Z':
+            self.file_queue.sort(key=lambda x: os.path.basename(x).lower())
+        elif sort_mode == '大小':
+            self.file_queue.sort(key=lambda x: os.path.getsize(x) if os.path.exists(x) else 0, reverse=True)
+        elif sort_mode == '修改时间':
+            self.file_queue.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
+        # '添加顺序' 保持原有顺序
+        
+        # 获取搜索关键词
+        search_text = self.search_var.get().strip().lower() if hasattr(self, 'search_var') else ''
+        
+        # 获取显示模式
+        view_mode = self.view_mode_combo.get() if hasattr(self, 'view_mode_combo') else '简洁'
+        
+        # 清空列表
+        self.file_listbox.delete(0, tk.END)
+        
+        # 过滤和填充列表
+        self._filtered_indices = []
+        filtered_count = 0
+        
+        for idx, path in enumerate(self.file_queue):
+            file_name = os.path.basename(path).lower()
+            
+            # 搜索过滤
+            if search_text and search_text not in file_name and search_text not in path.lower():
+                continue
+            
+            self._filtered_indices.append(idx)
+            filtered_count += 1
+            
+            if view_mode == '简洁':
+                display_text = os.path.basename(path)
+            elif view_mode == '详细':
+                parent = os.path.basename(os.path.dirname(path))
+                display_text = f"{os.path.basename(path)}  ({parent})"
+            else:  # 超详细
+                display_text = path
+            
+            self.file_listbox.insert(tk.END, display_text)
+        
+        # 更新搜索结果提示
+        if hasattr(self, 'search_result_label'):
+            if search_text:
+                self.search_result_label.config(text=f"找到 {filtered_count}/{len(self.file_queue)}")
+            else:
+                self.search_result_label.config(text="")
+        
+        self.update_file_count()
+
+    def open_output_folder(self):
+        """打开输出目录"""
+        if self.last_output_folder and os.path.exists(self.last_output_folder):
+            open_path_in_os(self.last_output_folder)
+        else:
+            messagebox.showinfo("提示", "尚未生成输出目录或目录不存在")
+
+    def on_key_selected(self, event=None):
         """选择API Key"""
         index = self.key_combo.current()
         if index >= 0:
             keys = self.config_manager.get_api_keys()
-            self.config_manager.set_current_key(keys[index]['id'])
-            self.api_status_label.config(text="API已连接")
+            if index < len(keys):
+                self.config_manager.set_current_key(keys[index]['id'])
+                self.api_status_label.config(text="API已连接")
     
     def on_drop(self, event):
         """处理拖拽"""
-        files = self.root.tk.splitlist(event.data)
-        for file_path in files:
-            file_path = file_path.strip('{}')
-            self.add_path(file_path)
+        try:
+            files = self.root.tk.splitlist(event.data)
+            for file_path in files:
+                file_path = file_path.strip('{}')
+                self.add_path(file_path)
+            self.update_file_count()
+        except Exception as e:
+            self.log_message(f"[ERROR] 拖拽处理失败: {e}")
     
-    def add_path(self, path):
+    def update_file_count(self):
+        """更新文件计数"""
+        count = len(self.file_queue)
+        self.file_count_label.config(text=f"已选择: {count} 个文件")
+        self.file_count_status.config(text=f"文件: {count}")
+    
+    def add_path(self, path: str):
         """添加路径"""
         if os.path.isfile(path):
             if path.lower().endswith(('.yml', '.yaml')) and path not in self.file_queue:
                 self.file_queue.append(path)
-                self.file_listbox.insert(tk.END, os.path.basename(path))
+                self._add_file_to_listbox(path)
         elif os.path.isdir(path):
-            core = YamlTranslatorCore(
-                {'api_key': '', 'platform': 'deepseek'}, 
-                TranslationConfig(), 
-                1
-            )
+            temp_config = TranslationConfig()
+            core = YamlTranslatorCore({'api_key': '', 'platform': 'deepseek'}, temp_config, 1)
             yaml_files = core.find_yaml_files(path)
             added = 0
             for f in yaml_files:
                 if f not in self.file_queue:
                     self.file_queue.append(f)
-                    self.file_listbox.insert(tk.END, os.path.basename(f))
+                    self._add_file_to_listbox(f)
                     added += 1
             if added > 0:
                 self.log_message(f"[INFO] 从文件夹添加了 {added} 个 YAML 文件")
+    
+    def _add_file_to_listbox(self, path: str):
+        """根据当前显示模式添加文件到列表"""
+        view_mode = self.view_mode_combo.get() if hasattr(self, 'view_mode_combo') else '简洁'
         
+        if view_mode == '简洁':
+            display_text = os.path.basename(path)
+        elif view_mode == '详细':
+            parent = os.path.basename(os.path.dirname(path))
+            display_text = f"{os.path.basename(path)}  ({parent})"
+        else:  # 超详细
+            display_text = path
+        
+        self.file_listbox.insert(tk.END, display_text)
+    
+    def add_files(self):
+        """添加文件"""
+        files = filedialog.askopenfilenames(
+            title="选择YAML文件",
+            filetypes=[("YAML文件", "*.yml *.yaml"), ("所有文件", "*.*")]
+        )
+        for f in files:
+            self.add_path(f)
+        self.update_file_count()
+    
+    def add_folder(self):
+        """添加文件夹"""
+        folder = filedialog.askdirectory(title="选择文件夹")
+        if folder:
+            self.current_base_folder = folder
+            self.add_path(folder)
+            self.update_file_count()
+    
+    def clear_files(self):
+        """清空文件列表"""
+        self.file_queue.clear()
+        self.file_listbox.delete(0, tk.END)
+        self.update_file_count()
+    
+    def clear_log(self):
+        """清空日志"""
+        self.log_text.delete(1.0, tk.END)
+    
+    def log_message(self, message: str):
+        """记录日志消息"""
+        level = "INFO"
+        if "[SUCCESS]" in message:
+            level = "SUCCESS"
+        elif "[WARNING]" in message:
+            level = "WARNING"
+        elif "[ERROR]" in message:
+            level = "ERROR"
+        
+        self.log_text.insert(tk.END, message + "\n", level)
+        self.log_text.see(tk.END)
+    
+    def update_progress(self, current: int, total: int, status: str = ""):
+        """更新进度"""
+        if total > 0:
+            progress = (current / total) * 100
+            self.progress_bar['value'] = progress
+            self.progress_label.config(text=f"{status} ({current}/{total})")
+        self.status_text.config(text=status if status else "处理中...")
+    
+    def start_translation(self):
+        """开始翻译 - 先显示预览对话框"""
+        if not self.file_queue:
+            messagebox.showwarning("警告", "请先添加要翻译的文件")
+            return
+        
+        current_key = self.config_manager.get_current_key()
+        if not current_key:
+            messagebox.showwarning("警告", "请先选择或配置 API Key")
+            return
+        
+        # 显示翻译预览对话框
+        TranslationPreviewDialog(
+            self.root,
+            self.file_queue.copy(),
+            self.config_manager,
+            on_confirm=self._do_start_translation
+        )
+    
+    def _do_start_translation(self):
+        """实际执行翻译"""
+        current_key = self.config_manager.get_current_key()
+        if not current_key:
+            return
+        
+        with self.translation_lock:
+            self.is_translating = True
+        
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.open_output_btn.config(state=tk.DISABLED)
+        self.status_text.config(text="翻译中...")
+        
+        api_config = {
+            'platform': current_key.get('platform', 'deepseek'),
+            'api_key': current_key['api_key'],
+            'model': current_key.get('model', 'deepseek-chat'),
+            'url': current_key.get('url', ''),
+            'temperature': current_key.get('temperature', 0.3),
+            'max_tokens': current_key.get('max_tokens', 1000),
+            'custom_prompt': current_key.get('custom_prompt', DEFAULT_PROMPT),
+            'max_retries': self.config_manager.config.get('max_retries', 3),
+            'retry_delay': self.config_manager.config.get('retry_delay', 5)
+        }
+        
+        translation_config = self.config_manager.get_translation_config()
+        
+        try:
+            max_threads = int(self.thread_spin.get())
+            max_threads = max(1, min(200, max_threads))
+        except ValueError:
+            max_threads = 4
+        
+        self.translator_core = YamlTranslatorCore(
+            api_config, 
+            translation_config, 
+            max_threads,
+            progress_callback=lambda c, t, s: self.root.after(0, lambda: self.update_progress(c, t, s)),
+            log_callback=lambda msg: self.root.after(0, lambda: self.log_message(msg))
+        )
+        
+        def run_translation():
+            try:
+                files = self.file_queue.copy()
+                base_folder = self.current_base_folder
+                if not base_folder and files:
+                    base_folder = os.path.dirname(files[0])
+                
+                # 计算并保存输出目录以便打开
+                output_folder = translation_config.output_folder
+                if not output_folder:
+                     # 如果是覆盖模式或未指定，默认取第一个文件的目录或translated子目录
+                    if translation_config.output_mode == 'overwrite':
+                        output_folder = os.path.dirname(files[0])
+                    else:
+                        output_folder = os.path.join(os.path.dirname(files[0]), 'translated')
+                
+                self.last_output_folder = output_folder
+                self.last_report_file = None
+
+                stats = self.translator_core.translate_files(files, base_folder)
+                self.last_stats = stats
+                
+                # 收集输出文件列表
+                self.last_output_files = []
+                for file_path in files:
+                    out_path = self.translator_core.get_output_path(file_path, base_folder)
+                    if os.path.exists(out_path):
+                        self.last_output_files.append(out_path)
+                
+                self.config_manager.add_history(stats, files)
+                
+                if self.config_manager.config.get('generate_report', True):
+                    # 报告存放在输出目录
+                    report_dir = output_folder
+                    if not os.path.exists(report_dir):
+                        try:
+                            os.makedirs(report_dir)
+                        except:
+                            report_dir = os.path.dirname(files[0])
+                            
+                    report_path = os.path.join(
+                        report_dir,
+                        f"translation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+                    )
+                    report_file = ReportGenerator.generate_html_report(
+                        stats, 
+                        self.translator_core.translation_records,
+                        report_path, 
+                        api_config
+                    )
+                    if report_file:
+                        self.last_report_file = report_file
+                        self.root.after(0, lambda: self.log_message(f"[INFO] 报告已生成: {report_file}"))
+                
+                self.root.after(0, lambda: self.on_translation_complete(show_dialog=True))
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.root.after(0, lambda: self.log_message(f"[ERROR] 翻译过程出错: {e}"))
+                self.root.after(0, lambda: self.on_translation_complete(show_dialog=False))
+        
+        thread = threading.Thread(target=run_translation, daemon=True)
+        thread.start()
+    
+    def stop_translation(self):
+        """停止翻译"""
+        if self.translator_core:
+            self.translator_core.stop()
+        self.log_message("[WARNING] 用户停止翻译")
+        self.on_translation_complete(show_dialog=False)
+    
+    def on_translation_complete(self, show_dialog: bool = False):
+        """翻译完成回调"""
+        with self.translation_lock:
+            self.is_translating = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        
+        # 启用打开输出目录按钮
+        if self.last_output_folder and os.path.exists(self.last_output_folder):
+             self.open_output_btn.config(state=tk.NORMAL)
+             
+        self.status_text.config(text="就绪")
+        self.progress_label.config(text="完成")
+        
+        # 显示翻译完成对话框
+        if show_dialog and self.last_stats:
+            TranslationCompleteDialog(
+                self.root,
+                self.last_stats,
+                self.last_output_folder,
+                self.last_output_files,
+                self.last_report_file
+            )
+    
+    def load_settings(self):
+        """加载设置"""
+        keys = self.config_manager.get_api_keys()
+        key_names = [k['name'] for k in keys]
+        self.key_combo['values'] = key_names
+        
+        if keys:
+            current_key = self.config_manager.get_current_key()
+            if current_key:
+                for i, k in enumerate(keys):
+                    if k['id'] == current_key['id']:
+                        self.key_combo.current(i)
+                        self.api_status_label.config(text="API已连接")
+                        break
+            else:
+                self.key_combo.current(0)
+                self.config_manager.set_current_key(keys[0]['id'])
+        
+        self.thread_spin.set(self.config_manager.config.get('max_threads', 4))
+    
+    def apply_theme(self):
+        """应用主题"""
+        theme = self.config_manager.config.get('theme', 'light')
+        # 主题应用逻辑可在此扩展
+    
+    def bind_shortcuts(self):
+        """绑定快捷键"""
+        self.root.bind('<Control-o>', lambda e: self.add_files())
+        self.root.bind('<Control-O>', lambda e: self.add_files())
+        self.root.bind('<Control-d>', lambda e: self.add_folder())
+        self.root.bind('<Control-D>', lambda e: self.add_folder())
+        self.root.bind('<Control-comma>', lambda e: self.show_settings())
+    
+    def show_key_manager(self):
+        """显示Key管理器"""
+        KeyManagerDialog(self.root, self.config_manager, self.load_settings)
+    
+    def show_field_config(self):
+        """显示字段配置"""
+        FieldConfigDialog(self.root, self.config_manager)
+    
+    def show_settings(self, tab=0):
+        """显示设置"""
+        SettingsDialog(self.root, self.config_manager, self.apply_theme, initial_tab=tab)
+    
+    def show_history(self):
+        """显示历史记录"""
+        HistoryDialog(self.root, self.config_manager)
+    
+    def show_help(self):
+        """显示帮助"""
+        help_window = tk.Toplevel(self.root)
+        help_window.title("使用说明")
+        help_window.geometry("500x400")
+        help_window.transient(self.root)
+        
+        text = scrolledtext.ScrolledText(help_window, wrap=tk.WORD, font=('Microsoft YaHei UI', 10))
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert('1.0', APP_DESCRIPTION)
+        text.config(state=tk.DISABLED)
+    
+    def show_about(self):
+        """显示关于"""
+        about_text = f"""{APP_TITLE}
+
+版本: {VERSION}
+
+{APP_DESCRIPTION}
+
+© 2024 All Rights Reserved"""
+        messagebox.showinfo("关于", about_text, parent=self.root)
+    
+    def export_config(self):
+        """导出配置"""
+        # 创建导出选项对话框
+        export_dialog = tk.Toplevel(self.root)
+        export_dialog.title("导出配置")
+        export_dialog.geometry("400x200")
+        export_dialog.transient(self.root)
+        export_dialog.grab_set()
+        
+        ttk.Label(export_dialog, text="导出配置", 
+                 font=('Microsoft YaHei UI', 11, 'bold'),
+                 padding="15").pack(anchor=tk.W)
+        
+        content = ttk.Frame(export_dialog, padding="15")
+        content.pack(fill=tk.BOTH, expand=True)
+        
+        include_keys_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(content, text="包含 API Keys（注意：这会暴露您的密钥）",
+                       variable=include_keys_var).pack(anchor=tk.W, pady=5)
+        
+        ttk.Label(content, text="提示：导出的配置不包含翻译历史记录",
+                 foreground='gray', font=('Microsoft YaHei UI', 8)).pack(anchor=tk.W, pady=5)
+        
+        def do_export():
+            export_path = filedialog.asksaveasfilename(
+                title="导出配置",
+                defaultextension=".json",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+                initialfilename="translator_config_export.json",
+                parent=export_dialog
+            )
+            
+            if export_path:
+                success, message = self.config_manager.export_config(
+                    export_path, include_keys_var.get()
+                )
+                if success:
+                    messagebox.showinfo("成功", message, parent=export_dialog)
+                    export_dialog.destroy()
+                else:
+                    messagebox.showerror("错误", message, parent=export_dialog)
+        
+        btn_frame = ttk.Frame(export_dialog, padding="15")
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="导出", command=do_export, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=export_dialog.destroy, width=12).pack(side=tk.LEFT)
+    
+    def import_config(self):
+        """导入配置"""
+        import_path = filedialog.askopenfilename(
+            title="导入配置",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        
+        if not import_path:
+            return
+        
+        # 创建导入选项对话框
+        import_dialog = tk.Toplevel(self.root)
+        import_dialog.title("导入配置")
+        import_dialog.geometry("450x220")
+        import_dialog.transient(self.root)
+        import_dialog.grab_set()
+        
+        ttk.Label(import_dialog, text="导入配置", 
+                 font=('Microsoft YaHei UI', 11, 'bold'),
+                 padding="15").pack(anchor=tk.W)
+        
+        content = ttk.Frame(import_dialog, padding="15")
+        content.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(content, text=f"文件: {os.path.basename(import_path)}",
+                 font=('Microsoft YaHei UI', 9)).pack(anchor=tk.W, pady=5)
+        
+        merge_var = tk.BooleanVar(value=True)
+        ttk.Radiobutton(content, text="合并模式（保留现有 API Keys，合并其他设置）",
+                       variable=merge_var, value=True).pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(content, text="覆盖模式（完全替换现有配置）",
+                       variable=merge_var, value=False).pack(anchor=tk.W, pady=2)
+        
+        ttk.Label(content, text="推荐使用合并模式，以保留您的 API Keys",
+                 foreground='gray', font=('Microsoft YaHei UI', 8)).pack(anchor=tk.W, pady=5)
+        
+        def do_import():
+            success, message = self.config_manager.import_config(
+                import_path, merge_var.get()
+            )
+            if success:
+                messagebox.showinfo("成功", message, parent=import_dialog)
+                import_dialog.destroy()
+                # 重新加载设置
+                self.load_settings()
+                self.apply_theme()
+            else:
+                messagebox.showerror("错误", message, parent=import_dialog)
+        
+        btn_frame = ttk.Frame(import_dialog, padding="15")
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="导入", command=do_import, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=import_dialog.destroy, width=12).pack(side=tk.LEFT)
+    
+    def on_closing(self):
+        """窗口关闭"""
+        with self.translation_lock:
+            if self.is_translating:
+                if not messagebox.askyesno("确认", "翻译正在进行中，确定要退出吗？"):
+                    return
+                self.stop_translation()
+        
+        self.config_manager.save_config()
+        self.root.destroy()
+
+
+# ==================== 程序入口 ====================
+
+def main():
+    """程序主入口"""
+    try:
+        if HAS_DND and TkinterDnD is not None:
+            root = TkinterDnD.Tk()
+        else:
+            root = tk.Tk()
+        
+        app = TranslatorGUI(root)
+        root.mainloop()
+        
+    except Exception as e:
+        import traceback
+        error_msg = traceback.format_exc()
+        print(f"程序启动失败:\n{error_msg}")
+        
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("启动错误", f"程序启动失败:\n{str(e)}\n\n详细信息已打印到控制台")
+            root.destroy()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
